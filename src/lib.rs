@@ -20,3 +20,8 @@ mod materialized;
 
 /// An implementation of Query Rewriting, an optimization that rewrites queries to make use of materialized views.
 mod rewrite;
+
+#[cfg(test)]
+mod test {
+    fn test_it_works() {}
+}
