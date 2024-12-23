@@ -2,5 +2,12 @@
 name = "datafusion-materialized-views"
 version = "0.1.0"
 edition = "2021"
+homepage = "https://github.com/datafusion-contrib/datafusion-materialized-views"
+repository = "https://github.com/datafusion-contrib/datafusion-materialized-views"
+authors = ["Matthew Cramerus <matt@polygon.io>"]
+license = "Apache-2.0"
+description = "Materialized Views & Query Rewriting in DataFusion"
+keywords = ["arrow", "arrow-rs", "datafusion"]
+rust-version = "1.73"
 
 [dependencies]
