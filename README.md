@@ -1,1 +1,1 @@
-# datafusion-materialized-view
+# datafusion-materialized-views
