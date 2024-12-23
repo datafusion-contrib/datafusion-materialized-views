@@ -23,5 +23,6 @@ mod rewrite;
 
 #[cfg(test)]
 mod test {
+    #[test]
     fn test_it_works() {}
 }
