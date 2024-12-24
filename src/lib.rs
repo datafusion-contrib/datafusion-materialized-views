@@ -15,14 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Code for incremental view maintenance.
-mod materialized;
+#![deny(missing_docs)]
+
+//! `datafusion-materialized-views` implements algorithms and functionality for materialized views in DataFusion.
+
+/// Code for incremental view maintenance against Hive-partitioned tables.
+///
+/// An example of a Hive-partitioned table is the [`ListingTable`](datafusion::datasource::listing::ListingTable).
+/// By analyzing the fragment of the materialized view query pertaining to the partition columns,
+/// we can derive a build graph that relates the files of a materialized views and the files of the tables it depends on.
+///
+/// A central trait is defined for Hive-partitioned tables, [`ListingTableLike`](materialized::ListingTableLike). Note that
+/// all implementations of [`ListingTableLike`](materialized::ListingTableLike) must be registered using the
+/// [`register_listing_table`](materialized::register_listing_table) function, otherwise the tables may not be detected by
+/// the incremental view maintenance code, including components such as [`FileMetadata`](materialized::file_metadata::FileMetadata)
+/// or [`RowMetadataRegistry`](materialized::row_metadata::RowMetadataRegistry).
+pub mod materialized;
 
 /// An implementation of Query Rewriting, an optimization that rewrites queries to make use of materialized views.
-mod rewrite;
-
-#[cfg(test)]
-mod test {
-    #[test]
-    fn test_it_works() {}
-}
+pub mod rewrite;
