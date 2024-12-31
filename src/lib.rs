@@ -36,7 +36,7 @@
 /// otherwise the tables may not be detected by the incremental view maintenance code,
 /// including components such as [`FileMetadata`](materialized::file_metadata::FileMetadata),
 /// [`RowMetadataRegistry`](materialized::row_metadata::RowMetadataRegistry), or the
-/// [`file_dependencies`](materialized::dependencies::file_dependencies) UDTF.
+/// [`mv_dependencies`](materialized::dependencies::mv_dependencies) UDTF.
 ///
 /// By default, `ListingTableLike` is implemented for [`ListingTable`](datafusion::datasource::listing::ListingTable),
 pub mod materialized;
