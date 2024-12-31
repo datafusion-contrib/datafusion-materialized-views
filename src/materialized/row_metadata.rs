@@ -30,6 +30,7 @@ use super::{file_metadata::FileMetadata, hive_partition::hive_partition, META_CO
 #[derive(Default)]
 pub struct RowMetadataRegistry {
     metadata_sources: DashMap<String, Arc<dyn RowMetadataSource>>,
+    default_source: Option<Arc<dyn RowMetadataSource>>,
 }
 
 impl std::fmt::Debug for RowMetadataRegistry {
@@ -48,6 +49,17 @@ impl std::fmt::Debug for RowMetadataRegistry {
 }
 
 impl RowMetadataRegistry {
+    /// Initializes this `RowMetadataRegistry` with a default `RowMetadataSource`
+    /// to be used if a table has not been explicitly registered with a specific source.
+    ///
+    /// Typically the [`FileMetadata`] source should be used as the default.
+    pub fn new_with_default_source(default_source: Arc<dyn RowMetadataSource>) -> Self {
+        Self {
+            default_source: Some(default_source),
+            ..Default::default()
+        }
+    }
+
     /// Registers a metadata source for a specific table.
     /// Returns the previously registered source for this table, if any
     pub fn register_source(
@@ -63,6 +75,7 @@ impl RowMetadataRegistry {
         self.metadata_sources
             .get(&table.to_string())
             .map(|o| Arc::clone(o.value()))
+            .or_else(|| self.default_source.clone())
             .ok_or_else(|| DataFusionError::Internal(format!("No metadata source for {}", table)))
     }
 }
