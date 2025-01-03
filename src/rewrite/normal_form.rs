@@ -274,7 +274,7 @@ impl SpjNormalForm {
 
             // Check that all references to the original tables have been replaced.
             // All remaining column expressions should be unqualified, which indicates
-            // that they refer to the ouput of the sub-plan (in this case the view)
+            // that they refer to the output of the sub-plan (in this case the view)
             if new_output_expr
                 .column_refs()
                 .iter()
