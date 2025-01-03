@@ -773,7 +773,7 @@ impl Predicate {
 /// in place of any other columns in the class.
 /// This Normal representative is chosen arbitrarily.
 #[derive(Debug, Clone, Default)]
-pub struct ColumnEquivalenceClass {
+struct ColumnEquivalenceClass {
     // first element is the Normal representative of the equivalence class
     columns: BTreeSet<Column>,
 }
