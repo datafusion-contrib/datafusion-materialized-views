@@ -2,9 +2,9 @@
 
 An implementation of incremental view maintenance & query rewriting for materialized views in DataFusion.
 
-A **materialized view** is a view whose query has been pre-computed and saved for later use. This can drastically speed up workloads by pre-computing at least a large fragment of a user-provided query. Furthermore, by implementing a _view matching_ algorithm, we can implement an optimizer that rewrites queries to automatically make use of materialized views where possible and beneficial, a concept known as *query rewriting*.
+A **materialized view** is a view whose query has been pre-computed and saved for later use. This can drastically speed up workloads by pre-computing at least a large fragment of a user-provided query. Furthermore, by implementing a _view matching_ algorithm, we can implement an optimizer that rewrites queries to automatically make use of materialized views where possible and beneficial, a concept known as _query rewriting_.
 
-Efficiently maintaining the up-to-dateness of a materialized view is a problem known as *incremental view maintenance*. It is a hard problem in general, but we make some simplifying assumptions:
+Efficiently maintaining the up-to-dateness of a materialized view is a problem known as _incremental view maintenance_. It is a hard problem in general, but we make some simplifying assumptions:
 
 * Data is stored as Hive-partitioned files in object storage.
 * The smallest unit of data that can be updated is a single file.
@@ -14,7 +14,7 @@ This is a typical pattern with DataFusion, as files in object storage usually ar
 ## Example
 
 Here we walk through a hypothetical example of setting up a materialized view, to illustrate
-what this library offers. The core of the incremental view maintenance implementation is a UDTF (User-Defined Table Function), 
+what this library offers. The core of the incremental view maintenance implementation is a UDTF (User-Defined Table Function),
 called `mv_dependencies`, that outputs a build graph for a materialized view. This gives users the information they need to determine
 when partitions of the materialized view need to be recomputed.
 
@@ -52,3 +52,15 @@ SELECT * FROM mv_dependencies('m1');
 +--------------------+----------------------+---------------------+-------------------+--------------------------------------+----------------------+
 ```
 
+## More detailed example (with code)
+
+As of now, actually implementing materialized views is somewhat complicated, as the library is initially focused on providing a minimal kernel of functionality that can be shared across multiple implementations of materialized views. Broadly, the process includes these steps:
+
+* Define a custom `MaterializedListingTable` type that implements `Materialized`
+* Register the type globally using the `register_materialized` global function
+* Initialize the `FileMetadata` component
+* Initialize the `RowMetadataRegistry`
+* Register the `mv_dependencies` and `stale_files` UDTFs (User Defined Table Functions) in your DataFusion `SessionContext`
+* Periodically regenerate directories marked as stale by `stale_files`
+
+A full walkthrough of this process including implementation can be seen in an integration test, under [`tests/materialized_listing_table.rs`](tests/materialized_listing_table.rs).
