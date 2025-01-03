@@ -27,7 +27,6 @@ use super::{file_metadata::FileMetadata, hive_partition::hive_partition, META_CO
 /// Registry that manages metadata sources for different tables.
 /// Provides a centralized way to register and retrieve metadata sources
 /// that can be used to obtain row-level metadata for tables.
-#[derive(Default)]
 pub struct RowMetadataRegistry {
     metadata_sources: DashMap<String, Arc<dyn RowMetadataSource>>,
     default_source: Option<Arc<dyn RowMetadataSource>>,
@@ -49,14 +48,24 @@ impl std::fmt::Debug for RowMetadataRegistry {
 }
 
 impl RowMetadataRegistry {
-    /// Initializes this `RowMetadataRegistry` with a default `RowMetadataSource`
+    /// Initializes this `RowMetadataRegistry` with a default [`RowMetadataSource`]
     /// to be used if a table has not been explicitly registered with a specific source.
     ///
     /// Typically the [`FileMetadata`] source should be used as the default.
     pub fn new_with_default_source(default_source: Arc<dyn RowMetadataSource>) -> Self {
         Self {
+            metadata_sources: Default::default(),
             default_source: Some(default_source),
-            ..Default::default()
+        }
+    }
+
+    /// Initializes a new `RowMetadataRegistry` with no default [`RowMetadataSource`].
+    ///
+    /// Users should typically use [`RowMetadataRegistry::new_with_default_source`].
+    pub fn new_empty() -> Self {
+        Self {
+            metadata_sources: Default::default(),
+            default_source: None,
         }
     }
 

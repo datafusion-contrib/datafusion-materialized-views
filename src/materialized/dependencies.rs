@@ -842,13 +842,12 @@ mod test {
     use datafusion_common::{Column, Result, ScalarValue};
     use datafusion_expr::{Expr, JoinType, LogicalPlan, TableType};
     use datafusion_physical_plan::ExecutionPlan;
-    use datafusion_sql::TableReference;
     use itertools::Itertools;
 
     use crate::materialized::{
         dependencies::pushdown_projection_inexact,
         register_materialized,
-        row_metadata::{ObjectStoreRowMetadataSource, RowMetadataRegistry, RowMetadataSource},
+        row_metadata::{ObjectStoreRowMetadataSource, RowMetadataRegistry},
         ListingTableLike, Materialized,
     };
 
@@ -1005,31 +1004,14 @@ mod test {
         .collect()
         .await?;
 
-        let row_metadata_registry = Arc::new(RowMetadataRegistry::default());
-        let t1_ref = TableReference::parse_str("t1").resolve(
-            &ctx.state().config_options().catalog.default_catalog,
-            &ctx.state().config_options().catalog.default_schema,
-        );
-        let t2_ref = TableReference::parse_str("t2").resolve(
-            &ctx.state().config_options().catalog.default_catalog,
-            &ctx.state().config_options().catalog.default_schema,
-        );
-        let t3_ref = TableReference::parse_str("t3").resolve(
-            &ctx.state().config_options().catalog.default_catalog,
-            &ctx.state().config_options().catalog.default_schema,
-        );
-
         let metadata_table = ctx.table_provider("file_metadata").await?;
         let object_store_metadata_source = Arc::new(
             ObjectStoreRowMetadataSource::with_file_metadata(Arc::clone(&metadata_table)),
         );
 
-        for r in [t1_ref, t2_ref, t3_ref] {
-            row_metadata_registry.register_source(
-                &r,
-                Arc::clone(&object_store_metadata_source) as Arc<dyn RowMetadataSource>,
-            );
-        }
+        let row_metadata_registry = Arc::new(RowMetadataRegistry::new_with_default_source(
+            object_store_metadata_source,
+        ));
 
         ctx.register_udtf(
             "mv_dependencies",
