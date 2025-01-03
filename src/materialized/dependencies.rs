@@ -200,12 +200,9 @@ impl TableFunctionImpl for StaleFilesUdtf {
                     col("expected_target").alias("target"),
                     col("target_last_modified"),
                     col("sources_last_modified"),
-                    coalesce(vec![
-                        col("target_last_modified"),
-                        lit(ScalarValue::TimestampNanosecond(Some(0), None)),
-                    ])
-                    .lt(col("sources_last_modified"))
-                    .alias("is_stale"),
+                    nvl(col("target_last_modified"), lit(0))
+                        .lt(col("sources_last_modified"))
+                        .alias("is_stale"),
                 ])?
                 .build()?;
 

@@ -17,7 +17,7 @@ use datafusion::{
 };
 use datafusion_common::{Constraints, DataFusionError, ParamValues, ScalarValue, Statistics};
 use datafusion_expr::{
-    col, dml::InsertOp, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr,
+    col, dml::InsertOp, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr,
     TableProviderFilterPushDown, TableType,
 };
 use datafusion_materialized_views::materialized::{
@@ -36,11 +36,16 @@ use object_store::path::Path as ObjectPath;
 use tempfile::TempDir;
 use url::Url;
 
+/// Configuration for a materialized listing table
 struct MaterializedListingConfig {
+    /// Path in object storage where the materialized data will be stored
     table_path: ListingTableUrl,
+    /// The query defining the view to be materialized
     query: LogicalPlan,
+    /// Additional configuration options
     options: Option<MaterializedListingOptions>,
 }
+
 struct MaterializedListingOptions {
     file_extension: String,
     format: Arc<dyn FileFormat>,
@@ -50,12 +55,234 @@ struct MaterializedListingOptions {
     file_sort_order: Vec<Vec<SortExpr>>,
 }
 
+/// A materialized [`ListingTable`].
 #[derive(Debug)]
 struct MaterializedListingTable {
+    /// The underlying [`ListingTable`]
     inner: ListingTable,
+    /// The query defining this materialized view
     query: LogicalPlan,
-    file_indices_in_query: Vec<usize>,
-    normalized_schema: SchemaRef,
+    /// The Arrow schema of the query
+    schema: SchemaRef,
+}
+
+impl ListingTableLike for MaterializedListingTable {
+    fn table_paths(&self) -> Vec<ListingTableUrl> {
+        <ListingTable as ListingTableLike>::table_paths(&self.inner)
+    }
+
+    fn partition_columns(&self) -> Vec<String> {
+        <ListingTable as ListingTableLike>::partition_columns(&self.inner)
+    }
+
+    fn file_ext(&self) -> String {
+        self.inner.file_ext()
+    }
+}
+
+impl Materialized for MaterializedListingTable {
+    fn query(&self) -> LogicalPlan {
+        self.query.clone()
+    }
+}
+
+struct TestContext {
+    _dir: TempDir,
+    ctx: SessionContext,
+}
+
+impl Deref for TestContext {
+    type Target = SessionContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ctx
+    }
+}
+
+async fn setup() -> Result<TestContext> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // All custom table providers must be registered using the `register_materialized` and/or `register_listing_table` APIs.
+    register_materialized::<MaterializedListingTable>();
+
+    // Override the object store with one rooted in a temporary directory
+
+    let dir = TempDir::new().context("create tempdir")?;
+    let store = LocalFileSystem::new_with_prefix(&dir)
+        .map(Arc::new)
+        .context("create local file system object store")?;
+
+    let registry = Arc::new(DefaultObjectStoreRegistry::new());
+    registry
+        .register_store(&Url::parse("file://").unwrap(), store)
+        .context("register file system store")
+        .expect("should replace existing object store at file://");
+
+    let ctx = SessionContext::new_with_config_rt(
+        SessionConfig::new(),
+        RuntimeEnvBuilder::new()
+            .with_object_store_registry(registry)
+            .build_arc()
+            .context("create RuntimeEnv")?,
+    );
+
+    // Now register the `mv_dependencies` and `stale_files` UDTFs
+    // They have `FileMetadata` and `RowMetadataRegistry` as dependencies.
+
+    let file_metadata = Arc::new(FileMetadata::new(Arc::clone(ctx.state().catalog_list())));
+
+    let row_metadata_registry = Arc::new(RowMetadataRegistry::new_with_default_source(Arc::new(
+        ObjectStoreRowMetadataSource::new(Arc::clone(&file_metadata)),
+    )));
+
+    ctx.register_udtf(
+        "mv_dependencies",
+        mv_dependencies(
+            Arc::clone(ctx.state().catalog_list()),
+            Arc::clone(&row_metadata_registry),
+            ctx.state().config_options(),
+        ),
+    );
+    ctx.register_udtf(
+        "stale_files",
+        stale_files(
+            Arc::clone(ctx.state().catalog_list()),
+            Arc::clone(&row_metadata_registry),
+            Arc::clone(&file_metadata) as Arc<dyn TableProvider>,
+            ctx.state().config_options(),
+        ),
+    );
+
+    // Create a table with some data
+    // Our materialized view will be derived from this table
+    ctx.sql(
+        "
+        CREATE EXTERNAL TABLE t1 (num INTEGER, date TEXT, feed CHAR)
+        STORED AS CSV
+        PARTITIONED BY (date, feed)
+        LOCATION 'file:///t1/'
+    ",
+    )
+    .await?
+    .show()
+    .await?;
+
+    ctx.sql(
+        "INSERT INTO t1 VALUES 
+        (1, '2023-01-01', 'A'),
+        (2, '2023-01-02', 'B'),
+        (3, '2023-01-03', 'C'),
+        (4, '2024-12-04', 'X'),
+        (5, '2024-12-05', 'Y'),
+        (6, '2024-12-06', 'Z')
+    ",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    Ok(TestContext { _dir: dir, ctx })
+}
+
+#[tokio::test]
+async fn test_materialized_listing_table_incremental_maintenance() -> Result<()> {
+    let ctx = setup().await.context("setup")?;
+
+    let query = ctx
+        .sql(
+            "
+        SELECT
+            COUNT(*) AS count,
+            CAST(date_part('YEAR', date) AS INT) AS year
+        FROM t1
+        GROUP BY year
+    ",
+        )
+        .await?
+        .into_unoptimized_plan();
+
+    let mv = Arc::new(MaterializedListingTable::try_new(
+        MaterializedListingConfig {
+            table_path: ListingTableUrl::parse("file:///m1/")?,
+            query,
+            options: Some(MaterializedListingOptions {
+                file_extension: ".parquet".to_string(),
+                format: Arc::<ParquetFormat>::default(),
+                table_partition_cols: vec!["year".into()],
+                collect_stat: false,
+                target_partitions: 1,
+                file_sort_order: vec![vec![SortExpr {
+                    expr: col("count"),
+                    asc: true,
+                    nulls_first: false,
+                }]],
+            }),
+        },
+    )?);
+
+    ctx.register_table("m1", Arc::clone(&mv) as Arc<dyn TableProvider>)?;
+
+    assert_eq!(
+        refresh_materialized_listing_table(&ctx, "m1".into()).await?,
+        vec![
+            // The initial call should refresh all Hive partitions
+            "file:///m1/year=2023/".to_string(),
+            "file:///m1/year=2024/".to_string()
+        ]
+    );
+    assert!(materialized_view_up_to_date(&ctx, &mv, "m1").await?);
+
+    // Insert another row into the source table
+    ctx.sql(
+        "INSERT INTO t1 VALUES 
+        (7, '2024-12-07', 'W')",
+    )
+    .await?
+    .collect()
+    .await?;
+
+    // Materialized view should be out of date now
+    assert!(!materialized_view_up_to_date(&ctx, &mv, "m1").await?);
+
+    // Refresh the materialized view and check that it's up to date again
+    assert_eq!(
+        refresh_materialized_listing_table(&ctx, "m1".into()).await?,
+        // Only the Hive partition for 2024 should be refreshed,
+        // since the row we added was in 2024.
+        vec!["file:///m1/year=2024/".to_string()]
+    );
+    assert!(materialized_view_up_to_date(&ctx, &mv, "m1").await?);
+
+    Ok(())
+}
+
+/// Check that the table's materialized data the same rows as its query.
+async fn materialized_view_up_to_date(
+    ctx: &TestContext,
+    mv: &MaterializedListingTable,
+    table_name: impl Into<TableReference>,
+) -> Result<bool> {
+    let table_name = table_name.into();
+    // Using anti-joins, verify A ⊆ B and B ⊆ A (therefore A = B)
+    for join_type in [JoinType::LeftAnti, JoinType::RightAnti] {
+        let num_rows_not_matching = ctx
+            .sql(&format!("SELECT * FROM {table_name}"))
+            .await?
+            .join(
+                ctx.execute_logical_plan(mv.query.clone()).await?,
+                join_type,
+                &["count", "year"],
+                &["count", "year"],
+                None,
+            )?
+            .count()
+            .await?;
+        if num_rows_not_matching != 0 {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 impl MaterializedListingTable {
@@ -79,15 +306,18 @@ impl MaterializedListingTable {
 
         let file_schema = schema.project(&file_indices)?;
 
-        let normalized_schema = Arc::new(
-            schema.project(
-                &file_indices
-                    .iter()
-                    .copied()
-                    .chain(partition_indices.iter().copied())
-                    .collect_vec(),
-            )?,
-        );
+        // Rewrite the query to have the partition columns at the end.
+        // It's convention for Hive-partitioned tables to have the partition columns at the end.
+        let normalizing_projection = file_indices
+            .iter()
+            .copied()
+            .chain(partition_indices.iter().copied())
+            .collect_vec();
+
+        let normalized_query = LogicalPlanBuilder::new(config.query.clone())
+            .select(normalizing_projection)?
+            .build()?;
+        let normalized_schema = Arc::new(normalized_query.schema().as_arrow().clone());
 
         let table_partition_cols = schema
             .project(&partition_indices)?
@@ -111,129 +341,20 @@ impl MaterializedListingTable {
                 file_schema: Some(Arc::new(file_schema)),
                 options,
             })?,
-            query: config.query,
-            file_indices_in_query: file_indices,
-            normalized_schema,
+            query: normalized_query,
+            schema: normalized_schema,
         })
     }
 }
 
-impl MaterializedListingTable {
-    fn job_for_partition(&self) -> Result<LogicalPlan, DataFusionError> {
-        use datafusion::prelude::*;
-        let part_cols = self.partition_columns();
-
-        LogicalPlanBuilder::new(self.query.clone())
-            .filter(
-                part_cols
-                    .iter()
-                    .enumerate()
-                    .map(|(i, pc)| col(pc).eq(placeholder(format!("{}", i + 1))))
-                    .fold(lit(true), |a, b| a.and(b)),
-            )?
-            .sort(self.inner.options().file_sort_order[0].clone())?
-            .select(self.file_indices_in_query.iter().copied())?
-            .build()
-    }
-
-    fn job_for_target(&self, target: ListingTableUrl) -> Result<LogicalPlan, DataFusionError> {
-        let partition_columns_with_data_types = self.inner.options().table_partition_cols.clone();
-
-        self.job_for_partition()?
-            .with_param_values(ParamValues::List(parse_partition_values(
-                target.prefix(),
-                &partition_columns_with_data_types,
-            )?))
-    }
-}
-
-#[async_trait::async_trait]
-impl TableProvider for MaterializedListingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.normalized_schema)
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
-        Some(Cow::Borrowed(&self.query))
-    }
-
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.inner.get_column_default(column)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        insert_op: InsertOp,
-    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        self.inner.insert_into(state, input, insert_op).await
-    }
-}
-impl ListingTableLike for MaterializedListingTable {
-    fn table_paths(&self) -> Vec<ListingTableUrl> {
-        <ListingTable as ListingTableLike>::table_paths(&self.inner)
-    }
-
-    fn partition_columns(&self) -> Vec<String> {
-        <ListingTable as ListingTableLike>::partition_columns(&self.inner)
-    }
-
-    fn file_ext(&self) -> String {
-        self.inner.file_ext()
-    }
-}
-
-impl Materialized for MaterializedListingTable {
-    fn query(&self) -> LogicalPlan {
-        self.query.clone()
-    }
-}
-
+/// Attempt to refresh the data in this materialized view.
 async fn refresh_materialized_listing_table(
     ctx: &TestContext,
     table_name: TableReference,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let stale_targets = ctx
         .sql(&format!(
-            "SELECT target FROM stale_files('{table_name}') WHERE is_stale"
+            "SELECT target FROM stale_files('{table_name}') WHERE is_stale ORDER BY target"
         ))
         .await?
         .collect()
@@ -251,7 +372,7 @@ async fn refresh_materialized_listing_table(
 
     let table = ctx.table_provider(table_name.clone()).await?;
 
-    for target in targets {
+    for target in &targets {
         refresh_mv_target(ctx, table.as_any().downcast_ref().unwrap(), target).await?;
     }
 
@@ -267,9 +388,13 @@ async fn refresh_materialized_listing_table(
         bail!("Expected no stale targets after materialization");
     }
 
-    Ok(())
+    Ok(targets.iter().map(|s| s.to_string()).collect())
 }
 
+/// Refresh a particular target directory for a materialized view.
+///
+/// More robust implementations should perform this atomically.
+/// For the sake of ease, we just delete the data then use the `ExecutionPlan::insert_into` API.
 async fn refresh_mv_target(
     ctx: &TestContext,
     table: &MaterializedListingTable,
@@ -306,140 +431,104 @@ async fn refresh_mv_target(
     Ok(())
 }
 
-struct TestContext {
-    _dir: TempDir,
-    ctx: SessionContext,
-}
+impl MaterializedListingTable {
+    /// Returns a query in the form of a logical plan, with placeholder parameters corresponding to the
+    /// partition columns of this table.
+    /// Data for a single partition can be generated by executing this query with the partition values as parameters.
+    fn job_for_partition(&self) -> Result<LogicalPlan, DataFusionError> {
+        use datafusion::prelude::*;
+        let part_cols = self.partition_columns();
 
-impl Deref for TestContext {
-    type Target = SessionContext;
+        LogicalPlanBuilder::new(self.query.clone())
+            .filter(
+                part_cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pc)| col(pc).eq(placeholder(format!("${}", i + 1))))
+                    .fold(lit(true), |a, b| a.and(b)),
+            )?
+            .sort(self.inner.options().file_sort_order[0].clone())?
+            .build()
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.ctx
+    /// Extracts the partition columns from the target URL and returns a query that can be executed
+    /// to regenerate the data for this target directory.
+    fn job_for_target(&self, target: ListingTableUrl) -> Result<LogicalPlan, DataFusionError> {
+        let partition_columns_with_data_types = self.inner.options().table_partition_cols.clone();
+
+        self.job_for_partition()?
+            .with_param_values(ParamValues::List(parse_partition_values(
+                target.prefix(),
+                &partition_columns_with_data_types,
+            )?))
     }
 }
 
-async fn setup() -> Result<TestContext> {
-    let _ = env_logger::builder().is_test(true).try_init();
+#[async_trait::async_trait]
+impl TableProvider for MaterializedListingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 
-    register_materialized::<MaterializedListingTable>();
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
 
-    let dir = TempDir::new().context("create tempdir")?;
-    let store = LocalFileSystem::new_with_prefix(&dir)
-        .map(Arc::new)
-        .context("create local file system object store")?;
+    fn constraints(&self) -> Option<&Constraints> {
+        self.inner.constraints()
+    }
 
-    let registry = Arc::new(DefaultObjectStoreRegistry::new());
-    registry
-        .register_store(&Url::parse("file://").unwrap(), store)
-        .context("register file system store")
-        .expect("should replace existing object store at file://");
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
 
-    let ctx = SessionContext::new_with_config_rt(
-        SessionConfig::new(),
-        RuntimeEnvBuilder::new()
-            .with_object_store_registry(registry)
-            .build_arc()
-            .context("create RuntimeEnv")?,
-    );
+    fn get_table_definition(&self) -> Option<&str> {
+        self.inner.get_table_definition()
+    }
 
-    let file_metadata = Arc::new(FileMetadata::new(Arc::clone(ctx.state().catalog_list())));
+    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+        // We _could_ return the LogicalPlan here,
+        // but it will cause this table to be treated like a regular view
+        // and the materialized results will not be used.
+        None
+    }
 
-    let row_metadata_registry = Arc::new(RowMetadataRegistry::new_with_default_source(Arc::new(
-        ObjectStoreRowMetadataSource::new(Arc::clone(&file_metadata)),
-    )));
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.inner.get_column_default(column)
+    }
 
-    ctx.register_udtf(
-        "mv_dependencies",
-        mv_dependencies(
-            Arc::clone(ctx.state().catalog_list()),
-            Arc::clone(&row_metadata_registry),
-            ctx.state().config_options(),
-        ),
-    );
-    ctx.register_udtf(
-        "stale_files",
-        stale_files(
-            Arc::clone(ctx.state().catalog_list()),
-            Arc::clone(&row_metadata_registry),
-            Arc::clone(&file_metadata) as Arc<dyn TableProvider>,
-            ctx.state().config_options(),
-        ),
-    );
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
 
-    ctx.sql(
-        "
-        CREATE EXTERNAL TABLE t1 (num INTEGER, date TEXT, feed CHAR)
-        STORED AS CSV
-        PARTITIONED BY (date)
-        LOCATION 'file:///t1/'
-    ",
-    )
-    .await?
-    .show()
-    .await?;
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+        self.inner.supports_filters_pushdown(filters)
+    }
 
-    ctx.sql(
-        "INSERT INTO t1 VALUES 
-        (1, '2023-01-01', 'A'),
-        (2, '2023-01-02', 'B'),
-        (3, '2023-01-03', 'C'),
-        (4, '2024-12-04', 'X'),
-        (5, '2024-12-05', 'Y'),
-        (6, '2024-12-06', 'Z')
-    ",
-    )
-    .await?
-    .collect()
-    .await?;
+    fn statistics(&self) -> Option<Statistics> {
+        self.inner.statistics()
+    }
 
-    Ok(TestContext { _dir: dir, ctx })
+    async fn insert_into(
+        &self,
+        state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.inner.insert_into(state, input, insert_op).await
+    }
 }
 
-#[tokio::test]
-async fn test_materialized_listing_table_works() -> Result<()> {
-    let ctx = setup().await.context("setup")?;
-
-    let query = ctx
-        .sql(
-            "
-        SELECT
-            COUNT(*) AS count,
-            feed,
-            date
-        FROM t1
-        GROUP BY date, feed
-    ",
-        )
-        .await?
-        .into_unoptimized_plan();
-
-    let mv = Arc::new(MaterializedListingTable::try_new(
-        MaterializedListingConfig {
-            table_path: ListingTableUrl::parse("file:///m1/")?,
-            query,
-            options: Some(MaterializedListingOptions {
-                file_extension: ".parquet".to_string(),
-                format: Arc::<ParquetFormat>::default(),
-                table_partition_cols: vec!["date".into()],
-                collect_stat: false,
-                target_partitions: 0,
-                file_sort_order: vec![vec![SortExpr {
-                    expr: col("feed"),
-                    asc: true,
-                    nulls_first: false,
-                }]],
-            }),
-        },
-    )?);
-
-    ctx.register_table("m1", mv)?;
-
-    refresh_materialized_listing_table(&ctx, "m1".into()).await?;
-
-    Ok(())
-}
-
+/// Parse partition column values from an object path.
 fn parse_partition_values(
     path: &ObjectPath,
     partition_columns: &[(String, DataType)],
