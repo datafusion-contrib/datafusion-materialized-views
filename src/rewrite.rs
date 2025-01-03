@@ -15,4 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion::{common::extensions_options, config::ConfigExtension};
+
+/// Implements a query rewriting optimizer, also known as "view exploitation"
+/// in some academic sources.
+pub mod exploitation;
+
 pub mod normal_form;
+
+mod util;
+
+extensions_options! {
+    /// Options for the query rewriting optimizer
+    pub struct QueryRewriteOptions {
+        /// Toggle query rewriting on or off
+        pub enabled: bool, default = true
+    }
+}
+
+impl ConfigExtension for QueryRewriteOptions {
+    const PREFIX: &'static str = "QueryRewrite";
+}

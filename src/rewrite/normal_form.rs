@@ -744,7 +744,7 @@ impl Predicate {
         )
     }
 
-    /// Rewrite all expressions in terms of their Normal representatives
+    /// Rewrite all expressions in terms of their normal representatives
     /// with respect to this predicate's equivalence classes.
     fn normalize_expr(&self, e: Expr) -> Expr {
         e.transform(&|e| {
@@ -769,12 +769,12 @@ impl Predicate {
 }
 
 /// A collection of columns that are all considered to be equivalent.
-/// In some cases we normalize expressions so that they use the "Normal" representative
+/// In some cases we normalize expressions so that they use the "normal" representative
 /// in place of any other columns in the class.
-/// This Normal representative is chosen arbitrarily.
+/// This normal representative is chosen arbitrarily.
 #[derive(Debug, Clone, Default)]
 struct ColumnEquivalenceClass {
-    // first element is the Normal representative of the equivalence class
+    // first element is the normal representative of the equivalence class
     columns: BTreeSet<Column>,
 }
 

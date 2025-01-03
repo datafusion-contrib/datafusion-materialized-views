@@ -43,6 +43,10 @@ impl std::fmt::Debug for RowMetadataRegistry {
                     .map(|r| (r.key().clone(), r.value().name().to_string()))
                     .collect::<BTreeMap<_, _>>(),
             )
+            .field(
+                "default_source",
+                &self.default_source.as_ref().map(|s| s.name()),
+            )
             .finish()
     }
 }

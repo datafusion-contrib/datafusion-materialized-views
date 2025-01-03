@@ -412,7 +412,7 @@ impl std::fmt::Debug for FileMetadataExec {
             .field("plan_properties", &self.plan_properties)
             .field("filters", &self.filters)
             .field("limit", &self.limit)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
