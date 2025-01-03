@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod normal_form;
+pub mod normal_form;
