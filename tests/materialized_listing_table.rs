@@ -41,7 +41,7 @@ use datafusion_materialized_views::materialized::{
     dependencies::{mv_dependencies, stale_files},
     file_metadata::FileMetadata,
     register_materialized,
-    row_metadata::{ObjectStoreRowMetadataSource, RowMetadataRegistry},
+    row_metadata::RowMetadataRegistry,
     ListingTableLike, Materialized,
 };
 use datafusion_physical_plan::{collect, ExecutionPlan};
@@ -147,10 +147,7 @@ async fn setup() -> Result<TestContext> {
     // They have `FileMetadata` and `RowMetadataRegistry` as dependencies.
 
     let file_metadata = Arc::new(FileMetadata::new(Arc::clone(ctx.state().catalog_list())));
-
-    let row_metadata_registry = Arc::new(RowMetadataRegistry::new_with_default_source(Arc::new(
-        ObjectStoreRowMetadataSource::new(Arc::clone(&file_metadata)),
-    )));
+    let row_metadata_registry = Arc::new(RowMetadataRegistry::new(Arc::clone(&file_metadata)));
 
     ctx.register_udtf(
         "mv_dependencies",

@@ -52,6 +52,15 @@ impl std::fmt::Debug for RowMetadataRegistry {
 }
 
 impl RowMetadataRegistry {
+    /// Initializes this `RowMetadataRegistry` with a [`FileMetadata`] as the default
+    /// row metadata source.
+    ///
+    /// This should be the typical entrypoint for most usecases.
+    pub fn new(file_metadata: Arc<FileMetadata>) -> Self {
+        Self::new_with_default_source(Arc::new(ObjectStoreRowMetadataSource::new(file_metadata))
+            as Arc<dyn RowMetadataSource + 'static>)
+    }
+
     /// Initializes this `RowMetadataRegistry` with a default [`RowMetadataSource`]
     /// to be used if a table has not been explicitly registered with a specific source.
     ///
