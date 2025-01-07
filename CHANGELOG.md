@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/datafusion-contrib/datafusion-materialized-views/compare/v0.1.0...v0.1.1) - 2025-01-07
+
+### Added
+- view exploitation (#19) (by @suremarc) - #19
+- SPJ normal form (#18) (by @suremarc) - #18
+
+### Other
+- add constructor for RowMetadataRegistry from FileMetadata ([#25](https://github.com/datafusion-contrib/datafusion-materialized-views/pull/25)) (by @suremarc) - #25
+- add changelog manually ([#14](https://github.com/datafusion-contrib/datafusion-materialized-views/pull/14)) (by @suremarc) - #14
+- don't use paths-ignore ([#15](https://github.com/datafusion-contrib/datafusion-materialized-views/pull/15)) (by @suremarc) - #15
+
+### Contributors
+
+* @suremarc
+
 ## [0.1.0](https://github.com/datafusion-contrib/datafusion-materialized-views/releases/tag/v0.1.0) - 2025-01-03
 
 ### Other
