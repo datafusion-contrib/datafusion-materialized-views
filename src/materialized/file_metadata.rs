@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{Int64Builder, StringBuilder, UInt64Builder};
+use arrow::array::{StringBuilder, TimestampNanosecondBuilder, UInt64Builder};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, Session};
@@ -65,7 +65,11 @@ impl FileMetadata {
                 Field::new("table_schema", DataType::Utf8, false),
                 Field::new("table_name", DataType::Utf8, false),
                 Field::new("file_path", DataType::Utf8, false),
-                Field::new("last_modified", DataType::Int64, false),
+                Field::new(
+                    "last_modified",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                    false,
+                ),
                 Field::new("size", DataType::UInt64, false),
             ])),
             catalog_list,
@@ -444,7 +448,7 @@ struct FileMetadataBuilder {
     schema_names: StringBuilder,
     table_names: StringBuilder,
     file_paths: StringBuilder,
-    last_modified: Int64Builder,
+    last_modified: TimestampNanosecondBuilder,
     size: UInt64Builder,
 }
 
@@ -456,7 +460,7 @@ impl FileMetadataBuilder {
             schema_names: StringBuilder::new(),
             table_names: StringBuilder::new(),
             file_paths: StringBuilder::new(),
-            last_modified: Int64Builder::new(),
+            last_modified: TimestampNanosecondBuilder::new().with_timezone("UTC"),
             size: UInt64Builder::new(),
         }
     }

@@ -200,9 +200,15 @@ impl TableFunctionImpl for StaleFilesUdtf {
                     col("expected_target").alias("target"),
                     col("target_last_modified"),
                     col("sources_last_modified"),
-                    nvl(col("target_last_modified"), lit(0))
-                        .lt(col("sources_last_modified"))
-                        .alias("is_stale"),
+                    nvl(
+                        col("target_last_modified"),
+                        lit(ScalarValue::TimestampNanosecond(
+                            Some(0),
+                            Some(Arc::from("UTC")),
+                        )),
+                    )
+                    .lt(col("sources_last_modified"))
+                    .alias("is_stale"),
                 ])?
                 .build()?;
 
