@@ -30,14 +30,14 @@ use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
-    PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
 };
 use datafusion::{
     catalog::CatalogProviderList, execution::TaskContext, physical_plan::SendableRecordBatchStream,
 };
 use datafusion_common::{DataFusionError, Result, ScalarValue, ToDFSchema};
 use datafusion_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::stream::{self, BoxStream};
 use futures::{future, Future, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
@@ -152,8 +152,12 @@ impl FileMetadataExec {
         };
         let eq_properties = EquivalenceProperties::new(projected_schema);
         let partitioning = Partitioning::UnknownPartitioning(1);
-        let execution_mode = ExecutionMode::Bounded;
-        let plan_properties = PlanProperties::new(eq_properties, partitioning, execution_mode);
+        let plan_properties = PlanProperties::new(
+            eq_properties,
+            partitioning,
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
 
         let exec = Self {
             table_schema,
@@ -724,7 +728,7 @@ mod test {
     use anyhow::{Context, Result};
     use datafusion::{
         assert_batches_sorted_eq,
-        catalog_common::{MemoryCatalogProvider, MemorySchemaProvider},
+        catalog::{MemoryCatalogProvider, MemorySchemaProvider},
         execution::{
             object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
             runtime_env::RuntimeEnvBuilder,

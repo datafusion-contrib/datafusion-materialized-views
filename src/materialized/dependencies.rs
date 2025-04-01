@@ -16,9 +16,9 @@
 // under the License.
 
 use datafusion::{
-    catalog::CatalogProviderList,
+    catalog::{CatalogProviderList, TableFunctionImpl},
     config::{CatalogOptions, ConfigOptions},
-    datasource::{function::TableFunctionImpl, provider_as_source, TableProvider, ViewTable},
+    datasource::{provider_as_source, TableProvider, ViewTable},
     prelude::{flatten, get_field, make_array},
 };
 use datafusion_common::{
@@ -112,7 +112,11 @@ impl TableFunctionImpl for FileDependenciesUdtf {
         ))?;
 
         Ok(Arc::new(ViewTable::try_new(
-            mv_dependencies_plan(mv, self.row_metadata_registry.clone(), &self.config_options)?,
+            mv_dependencies_plan(
+                mv,
+                self.row_metadata_registry.as_ref(),
+                &self.config_options,
+            )?,
             None,
         )?))
     }
@@ -230,7 +234,7 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
 /// for this materialized view, together with the dependencies for each target.
 pub fn mv_dependencies_plan(
     materialized_view: &dyn Materialized,
-    row_metadata_registry: Arc<RowMetadataRegistry>,
+    row_metadata_registry: &RowMetadataRegistry,
     config_options: &ConfigOptions,
 ) -> Result<LogicalPlan> {
     use datafusion_expr::logical_plan::*;
@@ -249,12 +253,19 @@ pub fn mv_dependencies_plan(
     // First expand all wildcards
     let plan = ExpandWildcardRule {}.analyze(plan, config_options)?;
 
-    // Prune non-partition columns from all table scans
-    let pruned_plan = pushdown_projection_inexact(plan, &partition_col_indices)?;
+    let pruned_plan_with_source_files = if partition_cols.is_empty() {
+        get_source_files_all_partitions(
+            materialized_view,
+            &config_options.catalog,
+            row_metadata_registry,
+        )
+    } else {
+        // Prune non-partition columns from all table scans
+        let pruned_plan = pushdown_projection_inexact(plan, &partition_col_indices)?;
 
-    // Now bubble up file metadata to the top of the plan
-    let pruned_plan_with_source_files =
-        push_up_file_metadata(pruned_plan, &config_options.catalog, row_metadata_registry)?;
+        // Now bubble up file metadata to the top of the plan
+        push_up_file_metadata(pruned_plan, &config_options.catalog, row_metadata_registry)
+    }?;
 
     // We now have data in the following form:
     // (partition_col0, partition_col1, ..., __meta)
@@ -722,13 +733,13 @@ fn project_dfschema(schema: &DFSchema, indices: &HashSet<usize>) -> Result<DFSch
 fn push_up_file_metadata(
     plan: LogicalPlan,
     catalog_options: &CatalogOptions,
-    row_metadata_registry: Arc<RowMetadataRegistry>,
+    row_metadata_registry: &RowMetadataRegistry,
 ) -> Result<LogicalPlan> {
     let alias_generator = AliasGenerator::new();
     plan.transform_up(|plan| {
         match plan {
             LogicalPlan::TableScan(scan) => {
-                scan_columns_from_row_metadata(scan, catalog_options, row_metadata_registry.clone())
+                scan_columns_from_row_metadata(scan, catalog_options, row_metadata_registry)
             }
             plan => project_row_metadata_from_input(plan, &alias_generator),
         }
@@ -800,7 +811,7 @@ fn project_row_metadata_from_input(
 fn scan_columns_from_row_metadata(
     scan: TableScan,
     catalog_options: &CatalogOptions,
-    row_metadata_registry: Arc<RowMetadataRegistry>,
+    row_metadata_registry: &RowMetadataRegistry,
 ) -> Result<LogicalPlan> {
     let table_ref = scan.table_name.clone().resolve(
         &catalog_options.default_catalog,
@@ -829,6 +840,75 @@ fn scan_columns_from_row_metadata(
                 .into_iter()
                 .fold(lit(true), |a, b| a.and(b)),
         )?
+        .build()
+}
+
+/// Assemble sources irrespective of partitions
+/// This is more efficient when the materialized view has no partitions,
+/// but less intelligent -- it may return additional dependencies not present in the
+/// usual algorithm.
+//
+// TODO: see if we can optimize the normal logic for no partitions.
+// It seems that joins get transformed into cross joins, which can become extremely inefficient.
+// Hence we had to implement this alternate, simpler but less precise algorithm.
+// Notably, it may include more false positives.
+fn get_source_files_all_partitions(
+    materialized_view: &dyn Materialized,
+    catalog_options: &CatalogOptions,
+    row_metadata_registry: &RowMetadataRegistry,
+) -> Result<LogicalPlan> {
+    use datafusion_common::tree_node::TreeNodeRecursion;
+
+    let mut tables = std::collections::HashMap::<TableReference, _>::new();
+
+    materialized_view
+        .query()
+        .apply(|plan| {
+            if let LogicalPlan::TableScan(scan) = plan {
+                tables.insert(scan.table_name.clone(), Arc::clone(&scan.source));
+            }
+
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+
+    tables
+        .into_iter()
+        .try_fold(
+            None::<LogicalPlanBuilder>,
+            |maybe_plan, (table_ref, source)| {
+                let resolved_ref = table_ref.clone().resolve(
+                    &catalog_options.default_catalog,
+                    &catalog_options.default_schema,
+                );
+
+                let row_metadata = row_metadata_registry.get_source(&resolved_ref)?;
+                let row_metadata_scan = row_metadata
+                    .row_metadata(
+                        resolved_ref,
+                        &TableScan {
+                            table_name: table_ref.clone(),
+                            source,
+                            projection: Some(vec![]), // no columns relevant
+                            projected_schema: Arc::new(DFSchema::empty()),
+                            filters: vec![],
+                            fetch: None,
+                        },
+                    )?
+                    .build()?;
+
+                if let Some(previous) = maybe_plan {
+                    previous.union(row_metadata_scan)
+                } else {
+                    Ok(LogicalPlanBuilder::from(row_metadata_scan))
+                }
+                .map(Some)
+            },
+        )?
+        .ok_or_else(|| DataFusionError::Plan("materialized view has no source tables".into()))?
+        // [`RowMetadataSource`] returns a Struct,
+        // but the MV algorithm expects a list of structs at each node in the plan.
+        .project(vec![make_array(vec![col(META_COLUMN)]).alias(META_COLUMN)])?
         .build()
 }
 
@@ -1549,9 +1629,9 @@ mod test {
                 name: "window & unnest",
                 query_to_analyze: "
                 SELECT
-                    \"unnest_placeholder(date).year\" AS year,
-                    \"unnest_placeholder(date).month\" AS month,
-                    \"unnest_placeholder(date).day\" AS day,
+                    \"__unnest_placeholder(date).year\" AS year,
+                    \"__unnest_placeholder(date).month\" AS month,
+                    \"__unnest_placeholder(date).day\" AS day,
                     arr
                 FROM (
                     SELECT
@@ -1568,14 +1648,14 @@ mod test {
                 )",
                 projection: &["year", "month", "day"],
                 expected_plan: vec![
-                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------+",
-                    "| plan_type    | plan                                                                                                                            |",
-                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------+",
-                    "| logical_plan | Projection: unnest_placeholder(date).year AS year, unnest_placeholder(date).month AS month, unnest_placeholder(date).day AS day |",
-                    "|              |   Unnest: lists[] structs[unnest_placeholder(date)]                                                                             |",
-                    "|              |     Projection: named_struct(Utf8(\"year\"), t2.year, Utf8(\"month\"), t2.month, Utf8(\"day\"), t2.day) AS unnest_placeholder(date)   |",
-                    "|              |       TableScan: t2 projection=[year, month, day]                                                                               |",
-                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------+",
+                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------------+",
+                    "| plan_type    | plan                                                                                                                                  |",
+                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------------+",
+                    "| logical_plan | Projection: __unnest_placeholder(date).year AS year, __unnest_placeholder(date).month AS month, __unnest_placeholder(date).day AS day |",
+                    "|              |   Unnest: lists[] structs[__unnest_placeholder(date)]                                                                                 |",
+                    "|              |     Projection: named_struct(Utf8(\"year\"), t2.year, Utf8(\"month\"), t2.month, Utf8(\"day\"), t2.day) AS __unnest_placeholder(date)       |",
+                    "|              |       TableScan: t2 projection=[year, month, day]                                                                                     |",
+                    "+--------------+---------------------------------------------------------------------------------------------------------------------------------------+",
                 ],
                 expected_output: vec![
                     "+------+-------+-----+",

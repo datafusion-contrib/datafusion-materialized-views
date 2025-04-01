@@ -34,5 +34,5 @@ extensions_options! {
 }
 
 impl ConfigExtension for QueryRewriteOptions {
-    const PREFIX: &'static str = "QueryRewrite";
+    const PREFIX: &'static str = "query_rewrite";
 }
