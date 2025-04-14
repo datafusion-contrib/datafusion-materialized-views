@@ -29,7 +29,7 @@ rust-version = "1.80"
 
 [dependencies]
 arrow = "54"
-arrow-schema = "54"
+arrow-schema = "55"
 async-trait = "0.1"
 dashmap = "6"
 datafusion = "46"
