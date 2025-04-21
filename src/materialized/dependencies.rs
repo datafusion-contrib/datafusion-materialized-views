@@ -31,7 +31,6 @@ use datafusion_expr::{
     col, lit, utils::split_conjunction, Expr, LogicalPlan, LogicalPlanBuilder, TableScan,
 };
 use datafusion_functions::string::expr_fn::{concat, concat_ws};
-use datafusion_optimizer::{analyzer::expand_wildcard_rule::ExpandWildcardRule, AnalyzerRule};
 use datafusion_sql::TableReference;
 use itertools::{Either, Itertools};
 use std::{collections::HashSet, sync::Arc};
@@ -111,14 +110,14 @@ impl TableFunctionImpl for FileDependenciesUdtf {
             "mv_dependencies: table '{table_name} is not a materialized view. (Materialized TableProviders must be registered using register_materialized"),
         ))?;
 
-        Ok(Arc::new(ViewTable::try_new(
+        Ok(Arc::new(ViewTable::new(
             mv_dependencies_plan(
                 mv,
                 self.row_metadata_registry.as_ref(),
                 &self.config_options,
             )?,
             None,
-        )?))
+        )))
     }
 }
 
@@ -216,7 +215,7 @@ impl TableFunctionImpl for StaleFilesUdtf {
                 ])?
                 .build()?;
 
-        Ok(Arc::new(ViewTable::try_new(logical_plan, None)?))
+        Ok(Arc::new(ViewTable::new(logical_plan, None)))
     }
 }
 
@@ -249,9 +248,6 @@ pub fn mv_dependencies_plan(
         .enumerate()
         .filter_map(|(i, f)| partition_cols.contains(f.name()).then_some(i))
         .collect();
-
-    // First expand all wildcards
-    let plan = ExpandWildcardRule {}.analyze(plan, config_options)?;
 
     let pruned_plan_with_source_files = if partition_cols.is_empty() {
         get_source_files_all_partitions(

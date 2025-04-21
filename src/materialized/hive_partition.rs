@@ -22,8 +22,8 @@ use arrow_schema::DataType;
 
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
-    expr::ScalarFunction, ColumnarValue, Expr, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    expr::ScalarFunction, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
 
 pub static HIVE_PARTITION_UDF_NAME: &str = "hive_partition";
@@ -101,7 +101,8 @@ impl ScalarUDFImpl for HivePartitionUdf {
         Ok(DataType::Utf8)
     }
 
-    fn invoke(&self, values: &[ColumnarValue]) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let values = args.args;
         let null_if_missing = values
             .get(2)
             .map(|val| match val {
@@ -113,7 +114,7 @@ impl ScalarUDFImpl for HivePartitionUdf {
             .transpose()?
             .unwrap_or(false);
 
-        let arrays = ColumnarValue::values_to_arrays(values)?;
+        let arrays = ColumnarValue::values_to_arrays(&values)?;
 
         let [file_paths, table_partition_columns]: [Option<&StringArray>; 2] =
             [&arrays[0], &arrays[1]].map(|arg| arg.as_any().downcast_ref());
