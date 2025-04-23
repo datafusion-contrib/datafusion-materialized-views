@@ -263,7 +263,7 @@ impl SpjNormalForm {
         source: Arc<dyn TableSource>,
     ) -> Result<Option<LogicalPlan>> {
         log::trace!("rewriting from {qualifier}");
-        let mut new_output_exprs = vec![];
+        let mut new_output_exprs = Vec::with_capacity(self.output_exprs.len());
         // check that our output exprs are sub-expressions of the other one's output exprs
         for (i, output_expr) in self.output_exprs.iter().enumerate() {
             let new_output_expr = other
@@ -350,7 +350,11 @@ impl Predicate {
         let mut schema = DFSchema::empty();
         plan.apply(|plan| {
             if let LogicalPlan::TableScan(scan) = plan {
-                schema = schema.join(&scan.projected_schema)?;
+                schema = if schema.fields().is_empty() {
+                    (*scan.projected_schema).clone()
+                } else {
+                    schema.join(&scan.projected_schema)?
+                }
             }
 
             Ok(TreeNodeRecursion::Continue)
@@ -367,14 +371,14 @@ impl Predicate {
         // Collect all referenced columns
         plan.apply(|plan| {
             if let LogicalPlan::TableScan(scan) = plan {
-                for (i, column) in scan.projected_schema.columns().iter().enumerate() {
+                for (i, (table_ref, field)) in scan.projected_schema.iter().enumerate() {
+                    let column = Column::new(table_ref.cloned(), field.name());
+                    let data_type = field.data_type();
                     new.eq_classes
                         .push(ColumnEquivalenceClass::new_singleton(column.clone()));
-                    new.eq_class_idx_by_column.insert(column.clone(), i);
+                    new.eq_class_idx_by_column.insert(column, i);
                     new.ranges_by_equivalence_class
-                        .push(Some(Interval::make_unbounded(
-                            scan.projected_schema.data_type(column)?,
-                        )?));
+                        .push(Some(Interval::make_unbounded(data_type)?));
                 }
             }
 
@@ -954,7 +958,7 @@ mod test {
         let ctx = SessionContext::new();
 
         ctx.sql(
-            "CREATE TABLE t1 AS VALUES 
+            "CREATE TABLE t1 AS VALUES
             ('2021', 3, 'A'),
             ('2022', 4, 'B'),
             ('2023', 5, 'C')",
@@ -1097,31 +1101,31 @@ mod test {
             TestCase {
                 name: "example from paper",
                 base: "\
-                SELECT 
-                    l_orderkey, 
-                    o_custkey, 
+                SELECT
+                    l_orderkey,
+                    o_custkey,
                     l_partkey,
                     l_shipdate, o_orderdate,
                     l_quantity*l_extendedprice AS gross_revenue
                 FROM example
                 WHERE
-                    l_orderkey = o_orderkey AND 
-                    l_partkey = p_partkey AND 
-                    p_partkey >= 150 AND 
-                    o_custkey >= 50 AND 
-                    o_custkey <= 500 AND 
+                    l_orderkey = o_orderkey AND
+                    l_partkey = p_partkey AND
+                    p_partkey >= 150 AND
+                    o_custkey >= 50 AND
+                    o_custkey <= 500 AND
                     p_name LIKE '%abc%'
                 ",
-                query: "SELECT 
-                    l_orderkey, 
-                    o_custkey, 
+                query: "SELECT
+                    l_orderkey,
+                    o_custkey,
                     l_partkey,
                     l_quantity*l_extendedprice
                 FROM example
-                WHERE 
+                WHERE
                     l_orderkey = o_orderkey AND
                     l_partkey = p_partkey AND
-                    l_partkey >= 150 AND 
+                    l_partkey >= 150 AND
                     l_partkey <= 160 AND
                     o_custkey = 123 AND
                     o_orderdate = l_shipdate AND
