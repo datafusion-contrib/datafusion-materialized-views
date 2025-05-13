@@ -44,6 +44,8 @@ use datafusion::{
 use datafusion_expr::LogicalPlan;
 use itertools::Itertools;
 
+use crate::MaterializedConfig;
+
 /// The identifier of the column that [`RowMetadataSource`](row_metadata::RowMetadataSource) implementations should store row metadata in.
 pub const META_COLUMN: &str = "__meta";
 
@@ -102,6 +104,12 @@ pub fn cast_to_listing_table(table: &dyn TableProvider) -> Option<&dyn ListingTa
 pub trait Materialized: ListingTableLike {
     /// The query that defines this materialized view.
     fn query(&self) -> LogicalPlan;
+
+    /// Configuration to control materialized view related features.
+    /// By default, returns the default value for [`MaterializedConfig`]
+    fn config(&self) -> MaterializedConfig {
+        MaterializedConfig::default()
+    }
 }
 
 /// Register a [`Materialized`] implementation in this registry.

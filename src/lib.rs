@@ -43,3 +43,18 @@ pub mod materialized;
 
 /// An implementation of Query Rewriting, an optimization that rewrites queries to make use of materialized views.
 pub mod rewrite;
+
+/// Configuration options for materialized view related features.
+#[derive(Debug, Clone)]
+pub struct MaterializedConfig {
+    /// Whether or not query rewriting should exploit this materialized view.
+    pub use_in_query_rewrite: bool,
+}
+
+impl Default for MaterializedConfig {
+    fn default() -> Self {
+        Self {
+            use_in_query_rewrite: true,
+        }
+    }
+}
