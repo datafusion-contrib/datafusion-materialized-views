@@ -657,8 +657,12 @@ fn widen_filter(
     })
 }
 
-/// An expression is considered 'relevant' if a single column is inside our index set.
+/// An expression is considered 'relevant' if all its columns are inside our index set.
 fn expr_is_relevant(expr: &Expr, indices: &HashSet<usize>, parent: &LogicalPlan) -> Result<bool> {
+    if expr.column_refs().is_empty() {
+        return Ok(false);
+    }
+
     let schemas = parent
         .inputs()
         .iter()
@@ -666,18 +670,20 @@ fn expr_is_relevant(expr: &Expr, indices: &HashSet<usize>, parent: &LogicalPlan)
         .collect_vec();
     let using_columns = parent.using_columns()?;
 
-    for c in expr.column_refs() {
-        let normalized_column = c
+    // Check if all column references are in our index set
+    let mut res = true;
+    for col in expr.column_refs() {
+        let normalized_column = col
             .clone()
             .normalize_with_schemas_and_ambiguity_check(&[&schemas], &using_columns)?;
         let column_idx = parent.schema().index_of_column(&normalized_column)?;
 
-        if indices.contains(&column_idx) {
-            return Ok(true);
+        if !indices.contains(&column_idx) {
+            res = false;
         }
     }
 
-    Ok(false)
+    Ok(res)
 }
 
 /// Get all referenced columns in the expression,
