@@ -657,8 +657,12 @@ fn widen_filter(
     })
 }
 
-/// An expression is considered 'relevant' if a single column is inside our index set.
+/// An expression is considered 'relevant' if all its columns are inside our index set.
 fn expr_is_relevant(expr: &Expr, indices: &HashSet<usize>, parent: &LogicalPlan) -> Result<bool> {
+    if expr.column_refs().is_empty() {
+        return Ok(false);
+    }
+
     let schemas = parent
         .inputs()
         .iter()
@@ -666,18 +670,20 @@ fn expr_is_relevant(expr: &Expr, indices: &HashSet<usize>, parent: &LogicalPlan)
         .collect_vec();
     let using_columns = parent.using_columns()?;
 
-    for c in expr.column_refs() {
-        let normalized_column = c
+    // Check if all column references are in our index set
+    let mut res = true;
+    for col in expr.column_refs() {
+        let normalized_column = col
             .clone()
             .normalize_with_schemas_and_ambiguity_check(&[&schemas], &using_columns)?;
         let column_idx = parent.schema().index_of_column(&normalized_column)?;
 
-        if indices.contains(&column_idx) {
-            return Ok(true);
+        if !indices.contains(&column_idx) {
+            res = false;
         }
     }
 
-    Ok(false)
+    Ok(res)
 }
 
 /// Get all referenced columns in the expression,
@@ -1332,6 +1338,7 @@ mod test {
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=04/feed=X/data.01.parquet | 2023-07-11T16:29:26  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=05/feed=Y/data.01.parquet | 2023-07-11T16:45:22  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=06/feed=Z/data.01.parquet | 2023-07-11T16:45:44  |",
+                    "| s3://m4/year=2024/ | datafusion           | test                | t3                | s3://t3/year=2023/data.01.parquet                        | 2023-07-11T16:45:44  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t3                | s3://t3/year=2024/data.01.parquet                        | 2023-07-11T16:45:44  |",
                     "+--------------------+----------------------+---------------------+-------------------+----------------------------------------------------------+----------------------+",
                 ],
@@ -1369,10 +1376,13 @@ mod test {
                     "| s3://m4/year=2023/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=01/feed=A/data.01.parquet | 2023-07-11T16:29:26  |",
                     "| s3://m4/year=2023/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=02/feed=B/data.01.parquet | 2023-07-11T16:45:22  |",
                     "| s3://m4/year=2023/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=03/feed=C/data.01.parquet | 2023-07-11T16:45:44  |",
+                    "| s3://m4/year=2023/ | datafusion           | test                | t3                | s3://t3/year=2023/data.01.parquet                        | 2023-07-11T16:45:44  |",
                     "| s3://m4/year=2023/ | datafusion           | test                | t3                | s3://t3/year=2024/data.01.parquet                        | 2023-07-11T16:45:44  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=04/feed=X/data.01.parquet | 2023-07-11T16:29:26  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=05/feed=Y/data.01.parquet | 2023-07-11T16:45:22  |",
                     "| s3://m4/year=2024/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=06/feed=Z/data.01.parquet | 2023-07-11T16:45:44  |",
+                    "| s3://m4/year=2024/ | datafusion           | test                | t3                | s3://t3/year=2023/data.01.parquet                        | 2023-07-11T16:45:44  |",
+                    "| s3://m4/year=2024/ | datafusion           | test                | t3                | s3://t3/year=2024/data.01.parquet                        | 2023-07-11T16:45:44  |",
                     "+--------------------+----------------------+---------------------+-------------------+----------------------------------------------------------+----------------------+",
                 ],
                 file_metadata: "
@@ -1596,14 +1606,13 @@ mod test {
                     ON (t2.year <= t3.year)",
                 projection: &["year"],
                 expected_plan: vec![
-                    "+--------------+-------------------------------------------+",
-                    "| plan_type    | plan                                      |",
-                    "+--------------+-------------------------------------------+",
-                    "| logical_plan | Projection: t2.year                       |",
-                    "|              |   Inner Join:  Filter: t2.year <= t3.year |",
-                    "|              |     TableScan: t2 projection=[year]       |",
-                    "|              |     TableScan: t3 projection=[year]       |",
-                    "+--------------+-------------------------------------------+",
+                    "+--------------+-----------------------------------+",
+                    "| plan_type    | plan                              |",
+                    "+--------------+-----------------------------------+",
+                    "| logical_plan | Cross Join:                       |",
+                    "|              |   TableScan: t2 projection=[year] |",
+                    "|              |   TableScan: t3 projection=[]     |",
+                    "+--------------+-----------------------------------+",
                 ],
                 expected_output: vec![
                     "+------+",
@@ -1615,6 +1624,9 @@ mod test {
                     "| 2023 |",
                     "| 2023 |",
                     "| 2023 |",
+                    "| 2024 |",
+                    "| 2024 |",
+                    "| 2024 |",
                     "| 2024 |",
                     "| 2024 |",
                     "| 2024 |",
