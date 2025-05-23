@@ -496,8 +496,19 @@ impl Predicate {
         let range = self
             .eq_class_idx_by_column
             .get(c)
-            .and_then(|&idx| self.ranges_by_equivalence_class.get_mut(idx))
-            .unwrap();
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("column {c} not found in equivalence classes"))
+            })
+            .and_then(|&idx| {
+                self.ranges_by_equivalence_class
+                    .get_mut(idx)
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(format!(
+                            "range not found class not found for column {c} with equivalence class {:?}", self.eq_classes.get(idx)
+                        ))
+                    })
+            })?;
+
         let new_range = match op {
             Operator::Eq => Interval::try_new(value.clone(), value.clone()),
             Operator::LtEq => {
