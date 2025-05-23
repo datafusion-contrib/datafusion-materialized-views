@@ -1106,76 +1106,76 @@ mod test {
     async fn test_rewrite() -> Result<()> {
         let _ = env_logger::builder().is_test(true).try_init();
         let cases = vec![
-            // TestCase {
-            //     name: "simple selection",
-            //     base: "SELECT * FROM t1",
-            //     query: "SELECT column1, column2 FROM t1",
-            // },
-            // TestCase {
-            //     name: "selection with equality predicate",
-            //     base: "SELECT * FROM t1",
-            //     query: "SELECT column1, column2 FROM t1 WHERE column1 = column3",
-            // },
-            // TestCase {
-            //     name: "selection with range filter",
-            //     base: "SELECT * FROM t1 WHERE column2 > 3",
-            //     query: "SELECT column1, column2 FROM t1 WHERE column2 > 4",
-            // },
-            // TestCase {
-            //     name: "nontrivial projection",
-            //     base: "SELECT concat(column1, column2), column2 FROM t1",
-            //     query: "SELECT concat(column1, column2) FROM t1",
-            // },
-            // TestCase {
-            //     name: "range filter + equality predicate",
-            //     base:
-            //         "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
-            //     query:
-            //     // Since column1 = column3 in the original view,
-            //     // we are allowed to substitute column1 for column3 and vice versa.
-            //         "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
-            // },
-            // TestCase {
-            //     name: "duplicate expressions (X-209)",
-            //     base: "SELECT * FROM t1",
-            //     query:
-            //         "SELECT column1, NULL AS column2, NULL AS column3, column3 AS column4 FROM t1",
-            // },
-            // TestCase {
-            //     name: "example from paper",
-            //     base: "\
-            //     SELECT
-            //         l_orderkey,
-            //         o_custkey,
-            //         l_partkey,
-            //         l_shipdate, o_orderdate,
-            //         l_quantity*l_extendedprice AS gross_revenue
-            //     FROM example
-            //     WHERE
-            //         l_orderkey = o_orderkey AND
-            //         l_partkey = p_partkey AND
-            //         p_partkey >= 150 AND
-            //         o_custkey >= 50 AND
-            //         o_custkey <= 500 AND
-            //         p_name LIKE '%abc%'
-            //     ",
-            //     query: "SELECT
-            //         l_orderkey,
-            //         o_custkey,
-            //         l_partkey,
-            //         l_quantity*l_extendedprice
-            //     FROM example
-            //     WHERE
-            //         l_orderkey = o_orderkey AND
-            //         l_partkey = p_partkey AND
-            //         l_partkey >= 150 AND
-            //         l_partkey <= 160 AND
-            //         o_custkey = 123 AND
-            //         o_orderdate = l_shipdate AND
-            //         p_name like '%abc%' AND
-            //         l_quantity*l_extendedprice > 100
-            //     ",
-            // },
+            TestCase {
+                name: "simple selection",
+                base: "SELECT * FROM t1",
+                query: "SELECT column1, column2 FROM t1",
+            },
+            TestCase {
+                name: "selection with equality predicate",
+                base: "SELECT * FROM t1",
+                query: "SELECT column1, column2 FROM t1 WHERE column1 = column3",
+            },
+            TestCase {
+                name: "selection with range filter",
+                base: "SELECT * FROM t1 WHERE column2 > 3",
+                query: "SELECT column1, column2 FROM t1 WHERE column2 > 4",
+            },
+            TestCase {
+                name: "nontrivial projection",
+                base: "SELECT concat(column1, column2), column2 FROM t1",
+                query: "SELECT concat(column1, column2) FROM t1",
+            },
+            TestCase {
+                name: "range filter + equality predicate",
+                base:
+                    "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
+                query:
+                // Since column1 = column3 in the original view,
+                // we are allowed to substitute column1 for column3 and vice versa.
+                    "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
+            },
+            TestCase {
+                name: "duplicate expressions (X-209)",
+                base: "SELECT * FROM t1",
+                query:
+                    "SELECT column1, NULL AS column2, NULL AS column3, column3 AS column4 FROM t1",
+            },
+            TestCase {
+                name: "example from paper",
+                base: "\
+                SELECT
+                    l_orderkey,
+                    o_custkey,
+                    l_partkey,
+                    l_shipdate, o_orderdate,
+                    l_quantity*l_extendedprice AS gross_revenue
+                FROM example
+                WHERE
+                    l_orderkey = o_orderkey AND
+                    l_partkey = p_partkey AND
+                    p_partkey >= 150 AND
+                    o_custkey >= 50 AND
+                    o_custkey <= 500 AND
+                    p_name LIKE '%abc%'
+                ",
+                query: "SELECT
+                    l_orderkey,
+                    o_custkey,
+                    l_partkey,
+                    l_quantity*l_extendedprice
+                FROM example
+                WHERE
+                    l_orderkey = o_orderkey AND
+                    l_partkey = p_partkey AND
+                    l_partkey >= 150 AND
+                    l_partkey <= 160 AND
+                    o_custkey = 123 AND
+                    o_orderdate = l_shipdate AND
+                    p_name like '%abc%' AND
+                    l_quantity*l_extendedprice > 100
+                ",
+            },
             TestCase {
                 name: "naked table scan with pushed down filters",
                 base: "SELECT column1 FROM t1 WHERE column2 <= 3",
