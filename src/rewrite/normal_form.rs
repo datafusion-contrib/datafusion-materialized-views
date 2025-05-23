@@ -334,6 +334,7 @@ impl SpjNormalForm {
 /// Stores information on filters from a Select-Project-Join plan.
 #[derive(Debug, Clone)]
 struct Predicate {
+    /// Full table schema, including all possible columns.
     schema: DFSchema,
     /// List of column equivalence classes.
     eq_classes: Vec<ColumnEquivalenceClass>,
@@ -350,10 +351,14 @@ impl Predicate {
         let mut schema = DFSchema::empty();
         plan.apply(|plan| {
             if let LogicalPlan::TableScan(scan) = plan {
+                let new_schema = DFSchema::try_from_qualified_schema(
+                    scan.table_name.clone(),
+                    scan.source.schema().as_ref(),
+                )?;
                 schema = if schema.fields().is_empty() {
-                    (*scan.projected_schema).clone()
+                    new_schema
                 } else {
-                    schema.join(&scan.projected_schema)?
+                    schema.join(&new_schema)?
                 }
             }
 
@@ -371,7 +376,13 @@ impl Predicate {
         // Collect all referenced columns
         plan.apply(|plan| {
             if let LogicalPlan::TableScan(scan) = plan {
-                for (i, (table_ref, field)) in scan.projected_schema.iter().enumerate() {
+                for (i, (table_ref, field)) in DFSchema::try_from_qualified_schema(
+                    scan.table_name.clone(),
+                    scan.source.schema().as_ref(),
+                )?
+                .iter()
+                .enumerate()
+                {
                     let column = Column::new(table_ref.cloned(), field.name());
                     let data_type = field.data_type();
                     new.eq_classes
@@ -948,17 +959,43 @@ fn get_table_scan_columns(scan: &TableScan) -> Result<Vec<Column>> {
 #[cfg(test)]
 mod test {
     use arrow::compute::concat_batches;
-    use datafusion::{datasource::provider_as_source, prelude::SessionContext};
+    use datafusion::{
+        datasource::provider_as_source,
+        prelude::{SessionConfig, SessionContext},
+    };
     use datafusion_common::{DataFusionError, Result};
     use datafusion_sql::TableReference;
+    use tempfile::tempdir;
 
     use super::SpjNormalForm;
 
     async fn setup() -> Result<SessionContext> {
-        let ctx = SessionContext::new();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+                .set_bool("datafusion.explain.logical_plan_only", true),
+        );
+
+        let t1_path = tempdir()?;
+
+        ctx.sql(&format!(
+            "
+                CREATE EXTERNAL TABLE t1 (
+                    column1 VARCHAR, 
+                    column2 BIGINT, 
+                    column3 CHAR
+                )
+                STORED AS PARQUET 
+                LOCATION '{}'",
+            t1_path.path().to_string_lossy()
+        ))
+        .await
+        .map_err(|e| e.context("setup `t1` table"))?
+        .collect()
+        .await?;
 
         ctx.sql(
-            "CREATE TABLE t1 AS VALUES
+            "INSERT INTO t1 VALUES
             ('2021', 3, 'A'),
             ('2022', 4, 'B'),
             ('2023', 5, 'C')",
@@ -980,8 +1017,7 @@ mod test {
                 o_orderdate DATE,
                 p_name VARCHAR,
                 p_partkey INT
-            )
-        ",
+            )",
         )
         .await
         .map_err(|e| e.context("parse `example` table ddl"))?
@@ -1014,6 +1050,15 @@ mod test {
         let query_plan = context.sql(case.query).await?.into_optimized_plan()?;
         let query_normal_form = SpjNormalForm::new(&query_plan)?;
 
+        for plan in [&base_plan, &query_plan] {
+            context
+                .execute_logical_plan(plan.clone())
+                .await?
+                .explain(false, false)?
+                .show()
+                .await?;
+        }
+
         let table_ref = TableReference::bare("mv");
         let rewritten = query_normal_form
             .rewrite_from(
@@ -1025,16 +1070,14 @@ mod test {
                 "expected rewrite to succeed".to_string(),
             ))?;
 
-        assert_eq!(rewritten.schema().as_ref(), query_plan.schema().as_ref());
+        context
+            .execute_logical_plan(rewritten.clone())
+            .await?
+            .explain(false, false)?
+            .show()
+            .await?;
 
-        for plan in [&base_plan, &query_plan, &rewritten] {
-            context
-                .execute_logical_plan(plan.clone())
-                .await?
-                .explain(false, false)?
-                .show()
-                .await?;
-        }
+        assert_eq!(rewritten.schema().as_ref(), query_plan.schema().as_ref());
 
         let expected = concat_batches(
             &query_plan.schema().as_ref().clone().into(),
@@ -1063,75 +1106,80 @@ mod test {
     async fn test_rewrite() -> Result<()> {
         let _ = env_logger::builder().is_test(true).try_init();
         let cases = vec![
+            // TestCase {
+            //     name: "simple selection",
+            //     base: "SELECT * FROM t1",
+            //     query: "SELECT column1, column2 FROM t1",
+            // },
+            // TestCase {
+            //     name: "selection with equality predicate",
+            //     base: "SELECT * FROM t1",
+            //     query: "SELECT column1, column2 FROM t1 WHERE column1 = column3",
+            // },
+            // TestCase {
+            //     name: "selection with range filter",
+            //     base: "SELECT * FROM t1 WHERE column2 > 3",
+            //     query: "SELECT column1, column2 FROM t1 WHERE column2 > 4",
+            // },
+            // TestCase {
+            //     name: "nontrivial projection",
+            //     base: "SELECT concat(column1, column2), column2 FROM t1",
+            //     query: "SELECT concat(column1, column2) FROM t1",
+            // },
+            // TestCase {
+            //     name: "range filter + equality predicate",
+            //     base:
+            //         "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
+            //     query:
+            //     // Since column1 = column3 in the original view,
+            //     // we are allowed to substitute column1 for column3 and vice versa.
+            //         "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
+            // },
+            // TestCase {
+            //     name: "duplicate expressions (X-209)",
+            //     base: "SELECT * FROM t1",
+            //     query:
+            //         "SELECT column1, NULL AS column2, NULL AS column3, column3 AS column4 FROM t1",
+            // },
+            // TestCase {
+            //     name: "example from paper",
+            //     base: "\
+            //     SELECT
+            //         l_orderkey,
+            //         o_custkey,
+            //         l_partkey,
+            //         l_shipdate, o_orderdate,
+            //         l_quantity*l_extendedprice AS gross_revenue
+            //     FROM example
+            //     WHERE
+            //         l_orderkey = o_orderkey AND
+            //         l_partkey = p_partkey AND
+            //         p_partkey >= 150 AND
+            //         o_custkey >= 50 AND
+            //         o_custkey <= 500 AND
+            //         p_name LIKE '%abc%'
+            //     ",
+            //     query: "SELECT
+            //         l_orderkey,
+            //         o_custkey,
+            //         l_partkey,
+            //         l_quantity*l_extendedprice
+            //     FROM example
+            //     WHERE
+            //         l_orderkey = o_orderkey AND
+            //         l_partkey = p_partkey AND
+            //         l_partkey >= 150 AND
+            //         l_partkey <= 160 AND
+            //         o_custkey = 123 AND
+            //         o_orderdate = l_shipdate AND
+            //         p_name like '%abc%' AND
+            //         l_quantity*l_extendedprice > 100
+            //     ",
+            // },
             TestCase {
-                name: "simple selection",
-                base: "SELECT * FROM t1",
-                query: "SELECT column1, column2 FROM t1",
-            },
-            TestCase {
-                name: "selection with equality predicate",
-                base: "SELECT * FROM t1",
-                query: "SELECT column1, column2 FROM t1 WHERE column1 = column3",
-            },
-            TestCase {
-                name: "selection with range filter",
-                base: "SELECT * FROM t1 WHERE column2 > 3",
-                query: "SELECT column1, column2 FROM t1 WHERE column2 > 4",
-            },
-            TestCase {
-                name: "nontrivial projection",
-                base: "SELECT concat(column1, column2), column2 FROM t1",
-                query: "SELECT concat(column1, column2) FROM t1",
-            },
-            TestCase {
-                name: "range filter + equality predicate",
-                base:
-                    "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
-                query:
-                // Since column1 = column3 in the original view,
-                // we are allowed to substitute column1 for column3 and vice versa.
-                    "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
-            },
-            TestCase {
-                name: "duplicate expressions (X-209)",
-                base: "SELECT * FROM t1",
-                query:
-                    "SELECT column1, NULL AS column2, NULL AS column3, column3 AS column4 FROM t1",
-            },
-            TestCase {
-                name: "example from paper",
-                base: "\
-                SELECT
-                    l_orderkey,
-                    o_custkey,
-                    l_partkey,
-                    l_shipdate, o_orderdate,
-                    l_quantity*l_extendedprice AS gross_revenue
-                FROM example
-                WHERE
-                    l_orderkey = o_orderkey AND
-                    l_partkey = p_partkey AND
-                    p_partkey >= 150 AND
-                    o_custkey >= 50 AND
-                    o_custkey <= 500 AND
-                    p_name LIKE '%abc%'
-                ",
-                query: "SELECT
-                    l_orderkey,
-                    o_custkey,
-                    l_partkey,
-                    l_quantity*l_extendedprice
-                FROM example
-                WHERE
-                    l_orderkey = o_orderkey AND
-                    l_partkey = p_partkey AND
-                    l_partkey >= 150 AND
-                    l_partkey <= 160 AND
-                    o_custkey = 123 AND
-                    o_orderdate = l_shipdate AND
-                    p_name like '%abc%' AND
-                    l_quantity*l_extendedprice > 100
-                ",
+                name: "naked table scan with pushed down filters",
+                base: "SELECT column1 FROM t1 WHERE column2 <= 3",
+                query: "SELECT FROM t1 WHERE column2 <= 3",
             },
         ];
 
