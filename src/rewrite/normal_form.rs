@@ -978,6 +978,10 @@ mod test {
 
         let t1_path = tempdir()?;
 
+        // Create external table to exercise parquet filter pushdown.
+        // This will put the filters directly inside the `TableScan` node.
+        // This is important because `TableScan` can have filters on 
+        // columns not in its own output.
         ctx.sql(&format!(
             "
                 CREATE EXTERNAL TABLE t1 (
