@@ -28,19 +28,19 @@ keywords = ["arrow", "arrow-rs", "datafusion"]
 rust-version = "1.80"
 
 [dependencies]
-arrow = "55"
-arrow-schema = "55"
+arrow = "55.1.0"
+arrow-schema = "55.1.0"
 async-trait = "0.1"
 dashmap = "6"
-datafusion = "47"
-datafusion-common = "47"
-datafusion-expr = "47"
-datafusion-functions = "47"
-datafusion-functions-aggregate = "47"
-datafusion-optimizer = "47"
-datafusion-physical-expr = "47"
-datafusion-physical-plan = "47"
-datafusion-sql = "47"
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-functions = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "992d156" }
 futures = "0.3"
 itertools = "0.14"
 log = "0.4"
