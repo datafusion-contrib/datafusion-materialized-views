@@ -455,6 +455,10 @@ impl Predicate {
                 self.eq_classes[idx].columns.insert(c2.clone());
             }
             (Some(&i), Some(&j)) => {
+                if i == j {
+                    // The two columns are already in the same equivalence class.
+                    return Ok(());
+                }
                 // We need to merge two existing column eq classes.
 
                 // Delete the eq class with a larger index,
@@ -984,7 +988,8 @@ mod test {
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-                .set_bool("datafusion.explain.logical_plan_only", true),
+                .set_bool("datafusion.explain.logical_plan_only", true)
+                .set_bool("datafusion.sql_parser.map_varchar_to_utf8view", false),
         );
 
         let t1_path = tempdir()?;
