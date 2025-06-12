@@ -989,7 +989,7 @@ mod test {
             SessionConfig::new()
                 .set_bool("datafusion.execution.parquet.pushdown_filters", true)
                 .set_bool("datafusion.explain.logical_plan_only", true)
-                .set_bool("datafusion.sql_parser.map_varchar_to_utf8view", false),
+                .set_bool("datafusion.sql_parser.map_varchar_to_utf8view", true),
         );
 
         let t1_path = tempdir()?;
