@@ -597,7 +597,7 @@ impl Predicate {
     /// Add a binary expression to our collection of filters.
     fn insert_binary_expr(&mut self, left: &Expr, op: Operator, right: &Expr) -> Result<()> {
         match (left, op, right) {
-            (Expr::Column(c), op, Expr::Literal(v)) => {
+            (Expr::Column(c), op, Expr::Literal(v, _)) => {
                 if let Err(e) = self.add_range(c, &op, v) {
                     // Add a range can fail in some cases, so just fallthrough
                     log::debug!("failed to add range filter: {e}");
@@ -605,7 +605,7 @@ impl Predicate {
                     return Ok(());
                 }
             }
-            (Expr::Literal(_), op, Expr::Column(_)) => {
+            (Expr::Literal(_, _), op, Expr::Column(_)) => {
                 if let Some(swapped) = op.swap() {
                     return self.insert_binary_expr(right, swapped, left);
                 }
@@ -718,14 +718,14 @@ impl Predicate {
                     extra_range_filters.push(Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(Expr::Column(other_column.clone())),
                         op: Operator::Eq,
-                        right: Box::new(Expr::Literal(range.lower().clone())),
+                        right: Box::new(Expr::Literal(range.lower().clone(), None)),
                     }))
                 } else {
                     if !range.lower().is_null() {
                         extra_range_filters.push(Expr::BinaryExpr(BinaryExpr {
                             left: Box::new(Expr::Column(other_column.clone())),
                             op: Operator::GtEq,
-                            right: Box::new(Expr::Literal(range.lower().clone())),
+                            right: Box::new(Expr::Literal(range.lower().clone(), None)),
                         }))
                     }
 
@@ -733,7 +733,7 @@ impl Predicate {
                         extra_range_filters.push(Expr::BinaryExpr(BinaryExpr {
                             left: Box::new(Expr::Column(other_column.clone())),
                             op: Operator::LtEq,
-                            right: Box::new(Expr::Literal(range.upper().clone())),
+                            right: Box::new(Expr::Literal(range.upper().clone(), None)),
                         }))
                     }
                 }
@@ -989,7 +989,7 @@ mod test {
             SessionConfig::new()
                 .set_bool("datafusion.execution.parquet.pushdown_filters", true)
                 .set_bool("datafusion.explain.logical_plan_only", true)
-                .set_bool("datafusion.sql_parser.map_varchar_to_utf8view", true),
+                .set_bool("datafusion.sql_parser.map_varchar_to_utf8view", false),
         );
 
         let t1_path = tempdir()?;
@@ -1001,11 +1001,11 @@ mod test {
         ctx.sql(&format!(
             "
                 CREATE EXTERNAL TABLE t1 (
-                    column1 VARCHAR, 
-                    column2 BIGINT, 
+                    column1 VARCHAR,
+                    column2 BIGINT,
                     column3 CHAR
                 )
-                STORED AS PARQUET 
+                STORED AS PARQUET
                 LOCATION '{}'",
             t1_path.path().to_string_lossy()
         ))
