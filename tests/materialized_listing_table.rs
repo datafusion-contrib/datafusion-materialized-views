@@ -39,7 +39,7 @@ use datafusion_expr::{
 };
 use datafusion_materialized_views::materialized::{
     dependencies::{mv_dependencies, stale_files},
-    file_metadata::FileMetadata,
+    file_metadata::{DefaultFileMetadataProvider, FileMetadata},
     register_materialized,
     row_metadata::RowMetadataRegistry,
     ListingTableLike, Materialized,
@@ -146,7 +146,10 @@ async fn setup() -> Result<TestContext> {
     // Now register the `mv_dependencies` and `stale_files` UDTFs
     // They have `FileMetadata` and `RowMetadataRegistry` as dependencies.
 
-    let file_metadata = Arc::new(FileMetadata::new(Arc::clone(ctx.state().catalog_list())));
+    let file_metadata = Arc::new(FileMetadata::new(
+        Arc::clone(ctx.state().catalog_list()),
+        Arc::new(DefaultFileMetadataProvider),
+    ));
     let row_metadata_registry = Arc::new(RowMetadataRegistry::new(Arc::clone(&file_metadata)));
 
     ctx.register_udtf(
