@@ -231,7 +231,7 @@ impl TableFunctionImpl for StaleFilesUdtf {
 /// Extract table name from args passed to TableFunctionImpl::call()
 fn get_table_name(args: &[Expr]) -> Result<&String> {
     match &args[0] {
-        Expr::Literal(ScalarValue::Utf8(Some(table_name))) => Ok(table_name),
+        Expr::Literal(ScalarValue::Utf8(Some(table_name)), _) => Ok(table_name),
         _ => Err(DataFusionError::Plan(
             "expected a single string literal argument to mv_dependencies".to_string(),
         )),
