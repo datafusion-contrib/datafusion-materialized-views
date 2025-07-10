@@ -98,7 +98,7 @@ impl RowMetadataRegistry {
             .get(&table.to_string())
             .map(|o| Arc::clone(o.value()))
             .or_else(|| self.default_source.clone())
-            .ok_or_else(|| DataFusionError::Internal(format!("No metadata source for {}", table)))
+            .ok_or_else(|| DataFusionError::Internal(format!("No metadata source for {table}")))
     }
 }
 

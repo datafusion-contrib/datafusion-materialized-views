@@ -1447,7 +1447,7 @@ mod test {
                 .enumerate()
                 .filter_map(|(i, c)| case.partition_cols.contains(&c.name.as_str()).then_some(i))
                 .collect();
-            println!("indices: {:?}", partition_col_indices);
+            println!("indices: {partition_col_indices:?}");
             let analyzed = pushdown_projection_inexact(plan.clone(), &partition_col_indices)?;
             println!(
                 "inexact projection pushdown:\n{}",
