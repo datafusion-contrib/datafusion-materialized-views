@@ -1447,7 +1447,7 @@ mod test {
                 .enumerate()
                 .filter_map(|(i, c)| case.partition_cols.contains(&c.name.as_str()).then_some(i))
                 .collect();
-            println!("indices: {:?}", partition_col_indices);
+            println!("indices: {partition_col_indices:?}");
             let analyzed = pushdown_projection_inexact(plan.clone(), &partition_col_indices)?;
             println!(
                 "inexact projection pushdown:\n{}",
@@ -1720,19 +1720,19 @@ mod test {
                 ",
                 projection: &["year"],
                 expected_plan: vec![
-                    "+--------------+--------------------------------------------------+",
-                    "| plan_type    | plan                                             |",
-                    "+--------------+--------------------------------------------------+",
-                    "| logical_plan | Union                                            |",
-                    "|              |   Projection: coalesce(t1.year, t2.year) AS year |",
-                    "|              |     Full Join: Using t1.year = t2.year           |",
-                    "|              |       SubqueryAlias: t1                          |",
-                    "|              |         Projection: t1.column1 AS year           |",
-                    "|              |           TableScan: t1 projection=[column1]     |",
-                    "|              |       SubqueryAlias: t2                          |",
-                    "|              |         TableScan: t2 projection=[year]          |",
-                    "|              |   TableScan: t3 projection=[year]                |",
-                    "+--------------+--------------------------------------------------+",
+                    "+--------------+--------------------------------------------------------------------+",
+                    "| plan_type    | plan                                                               |",
+                    "+--------------+--------------------------------------------------------------------+",
+                    "| logical_plan | Union                                                              |",
+                    "|              |   Projection: coalesce(CAST(t1.year AS Utf8View), t2.year) AS year |",
+                    "|              |     Full Join: Using CAST(t1.year AS Utf8View) = t2.year           |",
+                    "|              |       SubqueryAlias: t1                                            |",
+                    "|              |         Projection: t1.column1 AS year                             |",
+                    "|              |           TableScan: t1 projection=[column1]                       |",
+                    "|              |       SubqueryAlias: t2                                            |",
+                    "|              |         TableScan: t2 projection=[year]                            |",
+                    "|              |   TableScan: t3 projection=[year]                                  |",
+                    "+--------------+--------------------------------------------------------------------+",
                 ],
                 expected_output: vec![
                     "+------+",

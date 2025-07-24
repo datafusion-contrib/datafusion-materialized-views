@@ -226,7 +226,7 @@ impl ExecutionPlan for FileMetadataExec {
                     .map(|record_batch| {
                         record_batch
                             .project(&projection)
-                            .map_err(|e| DataFusionError::ArrowError(e, None))
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                     })
                     .collect::<Vec<_>>();
             }
@@ -858,7 +858,7 @@ mod test {
         .await?;
 
         ctx.sql(
-            "INSERT INTO t1 VALUES 
+            "INSERT INTO t1 VALUES
             (1, '2021'),
             (2, '2022'),
             (3, '2023'),
@@ -882,7 +882,7 @@ mod test {
         .await?;
 
         ctx.sql(
-            "INSERT INTO private.t1 VALUES 
+            "INSERT INTO private.t1 VALUES
             (1, '2021', '01'),
             (2, '2022', '02'),
             (3, '2023', '03'),
@@ -906,7 +906,7 @@ mod test {
         .await?;
 
         ctx.sql(
-            "INSERT INTO datafusion_mv.public.t3 VALUES 
+            "INSERT INTO datafusion_mv.public.t3 VALUES
             (1, '2021-01-01'),
             (2, '2022-02-02'),
             (3, '2023-03-03'),
@@ -929,8 +929,8 @@ mod test {
         ctx.sql(
             // Remove timestamps and trim (randomly generated) file names since they're not stable in tests
             "CREATE VIEW file_metadata_test_view AS SELECT
-                * EXCLUDE(file_path, last_modified), 
-                regexp_replace(file_path, '/[^/]*$', '/') AS file_path 
+                * EXCLUDE(file_path, last_modified),
+                regexp_replace(file_path, '/[^/]*$', '/') AS file_path
             FROM file_metadata",
         )
         .await
