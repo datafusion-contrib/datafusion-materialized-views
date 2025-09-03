@@ -25,7 +25,7 @@ authors = ["Matthew Cramerus <matt@polygon.io>"]
 license = "Apache-2.0"
 description = "Materialized Views & Query Rewriting in DataFusion"
 keywords = ["arrow", "arrow-rs", "datafusion"]
-rust-version = "1.80"
+rust-version = "1.85.1"
 
 [dependencies]
 arrow = "55.2.0"
