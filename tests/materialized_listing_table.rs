@@ -504,7 +504,7 @@ impl TableProvider for MaterializedListingTable {
         self.inner.get_table_definition()
     }
 
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         // We _could_ return the LogicalPlan here,
         // but it will cause this table to be treated like a regular view
         // and the materialized results will not be used.
