@@ -17,8 +17,9 @@
 
 use arrow::array::{StringBuilder, TimestampNanosecondBuilder, UInt64Builder};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::SchemaProvider;
 use datafusion::catalog::{CatalogProvider, Session};
 use datafusion::datasource::listing::ListingTableUrl;
@@ -35,7 +36,7 @@ use datafusion::physical_plan::{
 use datafusion::{
     catalog::CatalogProviderList, execution::TaskContext, physical_plan::SendableRecordBatchStream,
 };
-use datafusion_common::{DataFusionError, Result, ScalarValue, ToDFSchema};
+use datafusion_common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::stream::{self, BoxStream};
@@ -103,7 +104,7 @@ impl TableProvider for FileMetadata {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let dfschema = self.table_schema.clone().to_dfschema()?;
+        let dfschema = DFSchema::try_from(self.table_schema.as_ref().clone())?;
 
         let filters = filters
             .iter()

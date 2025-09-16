@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray, StringBuilder};
-use arrow_schema::DataType;
+use datafusion::arrow::datatypes::DataType;
 
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
@@ -79,7 +79,7 @@ pub fn hive_partition_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(udf_impl)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 struct HivePartitionUdf {
     pub signature: Signature,
 }
