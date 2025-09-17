@@ -1379,7 +1379,6 @@ mod test {
                     "| s3://m_dynamic/year=2024/month=12/day=06/ | 2023-07-10T16:00:00  | 2023-07-11T16:45:44   | true     |",
                     "+-------------------------------------------+----------------------+-----------------------+----------+",
                 ],
-                ..Default::default()
             },
             TestCase {
                 name: "materialized view has no partitions",
