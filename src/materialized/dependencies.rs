@@ -249,16 +249,16 @@ pub fn mv_dependencies_plan(
 
     let plan = materialized_view.query().clone();
 
-    let partition_cols = materialized_view.partition_columns();
-    let partition_col_indices = plan
+    let static_partition_cols = materialized_view.static_partition_columns();
+    let static_partition_col_indices = plan
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| partition_cols.contains(f.name()).then_some(i))
+        .filter_map(|(i, f)| static_partition_cols.contains(f.name()).then_some(i))
         .collect();
 
-    let pruned_plan_with_source_files = if partition_cols.is_empty() {
+    let pruned_plan_with_source_files = if static_partition_cols.is_empty() {
         get_source_files_all_partitions(
             materialized_view,
             &config_options.catalog,
@@ -266,14 +266,14 @@ pub fn mv_dependencies_plan(
         )
     } else {
         // Prune non-partition columns from all table scans
-        let pruned_plan = pushdown_projection_inexact(plan, &partition_col_indices)?;
+        let pruned_plan = pushdown_projection_inexact(plan, &static_partition_col_indices)?;
 
         // Now bubble up file metadata to the top of the plan
         push_up_file_metadata(pruned_plan, &config_options.catalog, row_metadata_registry)
     }?;
 
     // We now have data in the following form:
-    // (partition_col0, partition_col1, ..., __meta)
+    // (static_partition_col0, static_partition_col1, ..., __meta)
     // The last column is a list of structs containing the row metadata
     // We need to unnest it
 
@@ -289,7 +289,7 @@ pub fn mv_dependencies_plan(
     LogicalPlanBuilder::from(pruned_plan_with_source_files)
         .unnest_column(files)?
         .project(vec![
-            construct_target_path_from_partition_columns(materialized_view).alias("target"),
+            construct_target_path_from_static_partition_columns(materialized_view).alias("target"),
             get_field(files_col.clone(), "table_catalog").alias("source_table_catalog"),
             get_field(files_col.clone(), "table_schema").alias("source_table_schema"),
             get_field(files_col.clone(), "table_name").alias("source_table_name"),
@@ -300,14 +300,14 @@ pub fn mv_dependencies_plan(
         .build()
 }
 
-fn construct_target_path_from_partition_columns(materialized_view: &dyn Materialized) -> Expr {
+fn construct_target_path_from_static_partition_columns(materialized_view: &dyn Materialized) -> Expr {
     let table_path = lit(materialized_view.table_paths()[0]
         .as_str()
         // Trim the / (we'll add it back later if we need it)
         .trim_end_matches("/"));
     // Construct the paths for the build targets
     let mut hive_column_path_elements = materialized_view
-        .partition_columns()
+        .static_partition_columns()
         .iter()
         .map(|column_name| concat([lit(column_name.as_str()), lit("="), col(column_name)].to_vec()))
         .collect::<Vec<_>>();

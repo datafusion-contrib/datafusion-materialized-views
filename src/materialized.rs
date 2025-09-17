@@ -110,6 +110,14 @@ pub trait Materialized: ListingTableLike {
     fn config(&self) -> MaterializedConfig {
         MaterializedConfig::default()
     }
+
+    /// Which partition columns are 'static'.
+    /// Static partition columns are those that are used in incremental view maintenance.
+    /// These should be a prefix of the full set of partition columns returned by [`ListingTableLike::partition_columns`].
+    /// The rest of the partition columns are 'dynamic' and their values will be generated at runtime during incremental refresh.
+    fn static_partition_columns(&self) -> Vec<String> {
+        <Self as ListingTableLike>::partition_columns(&self)
+    }
 }
 
 /// Register a [`Materialized`] implementation in this registry.
