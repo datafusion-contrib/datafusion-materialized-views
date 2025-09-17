@@ -106,7 +106,7 @@ impl TableFunctionImpl for FileDependenciesUdtf {
         let table = util::get_table(self.catalog_list.as_ref(), &table_ref)
             .map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
-        let mv = cast_to_materialized(table.as_ref()).ok_or(DataFusionError::Plan(format!(
+        let mv = cast_to_materialized(table.as_ref())?.ok_or(DataFusionError::Plan(format!(
             "mv_dependencies: table '{table_name} is not a materialized view. (Materialized TableProviders must be registered using register_materialized"),
         ))?;
 
@@ -300,7 +300,9 @@ pub fn mv_dependencies_plan(
         .build()
 }
 
-fn construct_target_path_from_static_partition_columns(materialized_view: &dyn Materialized) -> Expr {
+fn construct_target_path_from_static_partition_columns(
+    materialized_view: &dyn Materialized,
+) -> Expr {
     let table_path = lit(materialized_view.table_paths()[0]
         .as_str()
         // Trim the / (we'll add it back later if we need it)
