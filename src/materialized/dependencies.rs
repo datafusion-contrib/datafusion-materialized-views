@@ -106,7 +106,7 @@ impl TableFunctionImpl for FileDependenciesUdtf {
         let table = util::get_table(self.catalog_list.as_ref(), &table_ref)
             .map_err(|e| DataFusionError::Plan(e.to_string()))?;
 
-        let mv = cast_to_materialized(table.as_ref()).ok_or(DataFusionError::Plan(format!(
+        let mv = cast_to_materialized(table.as_ref())?.ok_or(DataFusionError::Plan(format!(
             "mv_dependencies: table '{table_name} is not a materialized view. (Materialized TableProviders must be registered using register_materialized"),
         ))?;
 
@@ -166,6 +166,15 @@ impl TableFunctionImpl for StaleFilesUdtf {
             &self.mv_dependencies.config_options.catalog.default_schema,
         );
 
+        let table = util::get_table(self.mv_dependencies.catalog_list.as_ref(), &table_ref)
+            .map_err(|e| DataFusionError::Plan(e.to_string()))?;
+        let mv = cast_to_materialized(table.as_ref())?.ok_or(DataFusionError::Plan(format!(
+            "mv_dependencies: table '{table_name} is not a materialized view. (Materialized TableProviders must be registered using register_materialized"),
+        ))?;
+
+        let url = mv.table_paths()[0].to_string();
+        let num_static_partition_cols = mv.static_partition_columns().len();
+
         let logical_plan =
             LogicalPlanBuilder::scan_with_filters("dependencies", dependencies, None, vec![])?
                 .aggregate(
@@ -187,16 +196,21 @@ impl TableFunctionImpl for StaleFilesUdtf {
                     )?
                     .aggregate(
                         vec![
-                            // We want to omit the file name along with any "special" partitions
-                            // from the path before comparing it to the target partition. Special
-                            // partitions must be leaf most nodes and are designated by a leading
-                            // underscore. These are useful for adding additional information to a
-                            // filename without affecting partitioning or staleness checks.
-                            regexp_replace(
-                                col("file_path"),
-                                lit(r"(/_[^/=]+=[^/]+)*/[^/]*$"),
-                                lit("/"),
-                                None,
+                            // Omit the file name along with any "special" partitions.
+                            // This can include dynamic partition columns as well as some internal
+                            // metadata columns that are not part of the schema
+                            //
+                            // We implement this by only taking the first N columns,
+                            // where N is the number of static partition columns.
+                            array_element(
+                                regexp_match(
+                                    col("file_path"),
+                                    lit(format!(
+                                        "{url}(?:[^/=]+=[^/]+/){{{num_static_partition_cols}}}"
+                                    )),
+                                    None,
+                                ),
+                                lit(1),
                             )
                             .alias("existing_target"),
                         ],
@@ -249,16 +263,16 @@ pub fn mv_dependencies_plan(
 
     let plan = materialized_view.query().clone();
 
-    let partition_cols = materialized_view.partition_columns();
-    let partition_col_indices = plan
+    let static_partition_cols = materialized_view.static_partition_columns();
+    let static_partition_col_indices = plan
         .schema()
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| partition_cols.contains(f.name()).then_some(i))
+        .filter_map(|(i, f)| static_partition_cols.contains(f.name()).then_some(i))
         .collect();
 
-    let pruned_plan_with_source_files = if partition_cols.is_empty() {
+    let pruned_plan_with_source_files = if static_partition_cols.is_empty() {
         get_source_files_all_partitions(
             materialized_view,
             &config_options.catalog,
@@ -266,14 +280,14 @@ pub fn mv_dependencies_plan(
         )
     } else {
         // Prune non-partition columns from all table scans
-        let pruned_plan = pushdown_projection_inexact(plan, &partition_col_indices)?;
+        let pruned_plan = pushdown_projection_inexact(plan, &static_partition_col_indices)?;
 
         // Now bubble up file metadata to the top of the plan
         push_up_file_metadata(pruned_plan, &config_options.catalog, row_metadata_registry)
     }?;
 
     // We now have data in the following form:
-    // (partition_col0, partition_col1, ..., __meta)
+    // (static_partition_col0, static_partition_col1, ..., __meta)
     // The last column is a list of structs containing the row metadata
     // We need to unnest it
 
@@ -289,7 +303,7 @@ pub fn mv_dependencies_plan(
     LogicalPlanBuilder::from(pruned_plan_with_source_files)
         .unnest_column(files)?
         .project(vec![
-            construct_target_path_from_partition_columns(materialized_view).alias("target"),
+            construct_target_path_from_static_partition_columns(materialized_view).alias("target"),
             get_field(files_col.clone(), "table_catalog").alias("source_table_catalog"),
             get_field(files_col.clone(), "table_schema").alias("source_table_schema"),
             get_field(files_col.clone(), "table_name").alias("source_table_name"),
@@ -300,14 +314,16 @@ pub fn mv_dependencies_plan(
         .build()
 }
 
-fn construct_target_path_from_partition_columns(materialized_view: &dyn Materialized) -> Expr {
+fn construct_target_path_from_static_partition_columns(
+    materialized_view: &dyn Materialized,
+) -> Expr {
     let table_path = lit(materialized_view.table_paths()[0]
         .as_str()
         // Trim the / (we'll add it back later if we need it)
         .trim_end_matches("/"));
     // Construct the paths for the build targets
     let mut hive_column_path_elements = materialized_view
-        .partition_columns()
+        .static_partition_columns()
         .iter()
         .map(|column_name| concat([lit(column_name.as_str()), lit("="), col(column_name)].to_vec()))
         .collect::<Vec<_>>();
@@ -965,6 +981,7 @@ mod test {
     struct MockMaterializedView {
         table_path: ListingTableUrl,
         partition_columns: Vec<String>,
+        static_partition_columns: Option<Vec<String>>, // default = all partition columns
         query: LogicalPlan,
         file_ext: &'static str,
     }
@@ -1011,6 +1028,12 @@ mod test {
     impl Materialized for MockMaterializedView {
         fn query(&self) -> LogicalPlan {
             self.query.clone()
+        }
+
+        fn static_partition_columns(&self) -> Vec<String> {
+            self.static_partition_columns
+                .clone()
+                .unwrap_or_else(|| self.partition_columns.clone())
         }
     }
 
@@ -1181,12 +1204,14 @@ mod test {
 
     #[tokio::test]
     async fn test_deps() {
+        #[derive(Debug, Default)]
         struct TestCase {
             name: &'static str,
             query_to_analyze: &'static str,
             table_name: &'static str,
-            table_path: ListingTableUrl,
+            table_path: &'static str,
             partition_cols: Vec<&'static str>,
+            static_partition_cols: Option<Vec<&'static str>>,
             file_extension: &'static str,
             expected_output: Vec<&'static str>,
             file_metadata: &'static str,
@@ -1198,7 +1223,7 @@ mod test {
                 query_to_analyze:
                     "SELECT column1 AS partition_column, concat(column2, column3) AS some_value FROM t1",
                 table_name: "m1",
-                table_path: ListingTableUrl::parse("s3://m1/").unwrap(),
+                table_path: "s3://m1/",
                 partition_cols: vec!["partition_column"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1225,12 +1250,13 @@ mod test {
                     "| s3://m1/partition_column=2023/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+--------------------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
-            TestCase { name: "omit 'special' partition columns",
+            TestCase { name: "omit internal metadata partition columns",
                 query_to_analyze:
                     "SELECT column1 AS partition_column, concat(column2, column3) AS some_value FROM t1",
                 table_name: "m1",
-                table_path: ListingTableUrl::parse("s3://m1/").unwrap(),
+                table_path: "s3://m1/",
                 partition_cols: vec!["partition_column"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1257,6 +1283,7 @@ mod test {
                     "| s3://m1/partition_column=2023/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+--------------------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
             TestCase {
                 name: "transform year/month/day partition into timestamp partition",
@@ -1266,7 +1293,7 @@ mod test {
                     feed
                 FROM t2",
                 table_name: "m2",
-                table_path: ListingTableUrl::parse("s3://m2/").unwrap(),
+                table_path: "s3://m2/",
                 partition_cols: vec!["timestamp", "feed"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1301,12 +1328,63 @@ mod test {
                     "| s3://m2/timestamp=2024-12-06T00:00:00/feed=Z/ | 2023-07-10T16:00:00  | 2023-07-11T16:45:44   | true     |",
                     "+-----------------------------------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
+            },
+            TestCase {
+                name: "omit dynamic partition columns",
+                query_to_analyze: "
+                SELECT
+                    year,
+                    month,
+                    day,
+                    column2,
+                    COUNT(*) AS ct
+                FROM t2
+                GROUP BY year, month, day, column2
+                ",
+                table_name: "m_dynamic",
+                table_path: "s3://m_dynamic/",
+                partition_cols: vec!["year", "month", "day", "column2"],
+                static_partition_cols: Some(vec!["year", "month", "day"]),
+                file_extension: ".parquet",
+                expected_output: vec![
+                    "+-------------------------------------------+----------------------+---------------------+-------------------+----------------------------------------------------------+----------------------+",
+                    "| target                                    | source_table_catalog | source_table_schema | source_table_name | source_uri                                               | source_last_modified |",
+                    "+-------------------------------------------+----------------------+---------------------+-------------------+----------------------------------------------------------+----------------------+",
+                    "| s3://m_dynamic/year=2023/month=01/day=01/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=01/feed=A/data.01.parquet | 2023-07-11T16:29:26  |",
+                    "| s3://m_dynamic/year=2023/month=01/day=02/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=02/feed=B/data.01.parquet | 2023-07-11T16:45:22  |",
+                    "| s3://m_dynamic/year=2023/month=01/day=03/ | datafusion           | test                | t2                | s3://t2/year=2023/month=01/day=03/feed=C/data.01.parquet | 2023-07-11T16:45:44  |",
+                    "| s3://m_dynamic/year=2024/month=12/day=04/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=04/feed=X/data.01.parquet | 2023-07-11T16:29:26  |",
+                    "| s3://m_dynamic/year=2024/month=12/day=05/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=05/feed=Y/data.01.parquet | 2023-07-11T16:45:22  |",
+                    "| s3://m_dynamic/year=2024/month=12/day=06/ | datafusion           | test                | t2                | s3://t2/year=2024/month=12/day=06/feed=Z/data.01.parquet | 2023-07-11T16:45:44  |",
+                    "+-------------------------------------------+----------------------+---------------------+-------------------+----------------------------------------------------------+----------------------+",
+                ],
+                file_metadata: "
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2023/month=01/day=01/column2=1/data.01.parquet', '2023-07-12T16:00:00Z', 0),
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2023/month=01/day=02/column2=2/data.01.parquet', '2023-07-12T16:00:00Z', 0),
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2023/month=01/day=03/column2=3/data.01.parquet', '2023-07-10T16:00:00Z', 0),
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2024/month=12/day=04/column2=4/data.01.parquet', '2023-07-12T16:00:00Z', 0),
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2024/month=12/day=05/column2=5/data.01.parquet', '2023-07-12T16:00:00Z', 0),
+                    ('datafusion', 'test', 'm_dynamic', 's3://m_dynamic/year=2024/month=12/day=06/column2=6/data.01.parquet', '2023-07-10T16:00:00Z', 0)
+                ",
+                expected_stale_files_output: vec![
+                    "+-------------------------------------------+----------------------+-----------------------+----------+",
+                    "| target                                    | target_last_modified | sources_last_modified | is_stale |",
+                    "+-------------------------------------------+----------------------+-----------------------+----------+",
+                    "| s3://m_dynamic/year=2023/month=01/day=01/ | 2023-07-12T16:00:00  | 2023-07-11T16:29:26   | false    |",
+                    "| s3://m_dynamic/year=2023/month=01/day=02/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:22   | false    |",
+                    "| s3://m_dynamic/year=2023/month=01/day=03/ | 2023-07-10T16:00:00  | 2023-07-11T16:45:44   | true     |",
+                    "| s3://m_dynamic/year=2024/month=12/day=04/ | 2023-07-12T16:00:00  | 2023-07-11T16:29:26   | false    |",
+                    "| s3://m_dynamic/year=2024/month=12/day=05/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:22   | false    |",
+                    "| s3://m_dynamic/year=2024/month=12/day=06/ | 2023-07-10T16:00:00  | 2023-07-11T16:45:44   | true     |",
+                    "+-------------------------------------------+----------------------+-----------------------+----------+",
+                ],
             },
             TestCase {
                 name: "materialized view has no partitions",
                 query_to_analyze: "SELECT column1 AS output FROM t3",
                 table_name: "m3",
-                table_path: ListingTableUrl::parse("s3://m3/").unwrap(),
+                table_path: "s3://m3/",
                 partition_cols: vec![],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1327,12 +1405,13 @@ mod test {
                     "| s3://m3/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+----------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
             TestCase {
                 name: "simple equijoin on year",
                 query_to_analyze: "SELECT * FROM t2 INNER JOIN t3 USING (year)",
                 table_name: "m4",
-                table_path: ListingTableUrl::parse("s3://m4/").unwrap(),
+                table_path: "s3://m4/",
                 partition_cols: vec!["year"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1361,6 +1440,7 @@ mod test {
                     "| s3://m4/year=2024/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+--------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
             TestCase {
                 name: "triangular join on year",
@@ -1373,7 +1453,7 @@ mod test {
                     INNER JOIN t3
                     ON (t2.year <= t3.year)",
                 table_name: "m4",
-                table_path: ListingTableUrl::parse("s3://m4/").unwrap(),
+                table_path: "s3://m4/",
                 partition_cols: vec!["year"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1403,6 +1483,7 @@ mod test {
                     "| s3://m4/year=2024/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+--------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
             TestCase {
                 name: "triangular left join, strict <",
@@ -1415,7 +1496,7 @@ mod test {
                     LEFT JOIN t3
                     ON (t2.year < t3.year)",
                 table_name: "m4",
-                table_path: ListingTableUrl::parse("s3://m4/").unwrap(),
+                table_path: "s3://m4/",
                 partition_cols: vec!["year"],
                 file_extension: ".parquet",
                 expected_output: vec![
@@ -1443,6 +1524,7 @@ mod test {
                     "| s3://m4/year=2024/ | 2023-07-12T16:00:00  | 2023-07-11T16:45:44   | false    |",
                     "+--------------------+----------------------+-----------------------+----------+",
                 ],
+                ..Default::default()
             },
         ];
 
@@ -1476,12 +1558,16 @@ mod test {
                     // Register table with a decorator to exercise this functionality
                     Arc::new(DecoratorTable {
                         inner: Arc::new(MockMaterializedView {
-                            table_path: case.table_path.clone(),
+                            table_path: ListingTableUrl::parse(case.table_path).unwrap(),
                             partition_columns: case
                                 .partition_cols
                                 .iter()
                                 .map(|s| s.to_string())
                                 .collect(),
+                            static_partition_columns: case
+                                .static_partition_cols
+                                .as_ref()
+                                .map(|list| list.iter().map(|s| s.to_string()).collect()),
                             query: plan,
                             file_ext: case.file_extension,
                         }),
@@ -1496,6 +1582,15 @@ mod test {
                 ))
                 .await?
                 .collect()
+                .await?;
+
+            context
+                .sql(&format!(
+                    "SELECT * FROM file_metadata WHERE table_name = '{}'",
+                    case.table_name
+                ))
+                .await?
+                .show()
                 .await?;
 
             let df = context
