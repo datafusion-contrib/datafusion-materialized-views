@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Track dependencies of materialized data in object storage
 pub mod dependencies;
 
 /// Pluggable metadata sources for incremental view maintenance

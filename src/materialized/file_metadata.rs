@@ -722,7 +722,7 @@ impl FileMetadataBuilder {
     }
 }
 
-/// Provides [`ObjectMetadata`] data to the [`FileMetadata`] table provider.
+/// Provides [`ObjectMeta`] data to the [`FileMetadata`] table provider.
 #[async_trait]
 pub trait FileMetadataProvider: std::fmt::Debug + Send + Sync {
     /// List all files in the store for the given `url` prefix.
