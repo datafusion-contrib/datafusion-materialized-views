@@ -26,13 +26,13 @@ The dependency analysis in a nutshell involves analyzing the fragment of the mat
 partition columns (or row metadata columns more generally). This logical fragment is then used to generate a dependency graph between physical partitions
 of the materialized view and its source tables. This gives rise to two natural phases of the algorithm:
 1. **Inexact Projection Pushdown**: We aggressively prune the logical plan to only include partition columns (or row metadata columns more generally) of the materialized view and its sources.
-   This is similar to pushing down a top-level projection on the materialized view's partition columns. However, "inexact" means that we do not preserve cardinality, order,
+   This is similar to pushing down a top-level projection on the materialized view's partition columns. However, "inexact" means that we do not preserve duplicates, order,
    or even set equality of the original query.
    * Formally, let P be the (exact) projection operator. If A is the original plan and A' is the result of "inexact" projection pushdown, we have PA ⊆ A'.
    * This means that in the final output, we may have dependencies that do not exist in the original query. However, we will never miss any dependencies.
 2. **Dependency Graph Construction**: Once we have the pruned logical plan, we can construct a dependency graph between the physical partitions of the materialized view and its sources.
    After step 1, every table scan only contains row metadata columns, so we replace the table scan with an equivalent scan to a [`RowMetadataSource`](super::row_metadata::RowMetadataSource)
-   This operation also is not cardinality or order preserving. Then, additional metadata is "pushed up" through the plan to the root, where it can be unnested to give a list of source files for each output row.
+   This operation also is not duplicate or order preserving. Then, additional metadata is "pushed up" through the plan to the root, where it can be unnested to give a list of source files for each output row.
    The output rows are then transformed into object storage paths to generate the final graph.
 
 The transformation is complex, and we give a full walkthrough in the documentation for [`mv_dependencies_plan`].
@@ -325,10 +325,10 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
 ///     C --> E["TableScan: daily_statistics (projection=[date])"]
 /// ```
 ///
-/// Note that the `Aggregate` node was converted into a projection. This is valid because we do not need to preserve cardinality. However, it does imply that
+/// Note that the `Aggregate` node was converted into a projection. This is valid because we do not need to preserve duplicate rows. However, it does imply that
 /// we cannot partition the materialized view on aggregate expressions.
 ///
-/// Now we substitute all scans with equivalent row metadata scans (up to cardinality), and push up the row metadata to the root of the plan,
+/// Now we substitute all scans with equivalent row metadata scans (up to addition or removal of duplicates), and push up the row metadata to the root of the plan,
 /// together with the target path constructed from the (static) partition columns. This gives us the following plan:
 ///
 /// ```mermaid
