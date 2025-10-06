@@ -29,6 +29,7 @@ of the materialized view and its source tables. This gives rise to two natural p
    This is similar to pushing down a top-level projection on the materialized view's partition columns. However, "inexact" means that we do not preserve cardinality, order,
    or even set equality of the original query.
    * Formally, let P be the (exact) projection operator. If A is the original plan and A' is the result of "inexact" projection pushdown, we have PA ⊆ A'.
+   * This means that in the final output, we may have dependencies that do not exist in the original query. However, we will never miss any dependencies.
 2. **Dependency Graph Construction**: Once we have the pruned logical plan, we can construct a dependency graph between the physical partitions of the materialized view and its sources.
    After step 1, every table scan only contains row metadata columns, so we replace the table scan with an equivalent scan to a [`RowMetadataSource`](super::row_metadata::RowMetadataSource)
    This operation also is not cardinality or order preserving. Then, additional metadata is "pushed up" through the plan to the root, where it can be unnested to give a list of source files for each output row.
