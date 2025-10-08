@@ -17,7 +17,7 @@
 
 /*!
 
-This module contains code primarily used for view matching. We implement the view matching algorithm from [this paper](https://courses.cs.washington.edu/courses/cse591d/01sp/opt_views.pdf),
+This module contains code primarily used for view matching. We implement the view matching algorithm from [this paper](https://dsg.uwaterloo.ca/seminars/notes/larson-paper.pdf),
 which provides a method for determining when one Select-Project-Join query can be rewritten in terms of another Select-Project-Join query.
 
 The implementation is contained in [`SpjNormalForm::rewrite_from`]. The method can be summarized as follows:

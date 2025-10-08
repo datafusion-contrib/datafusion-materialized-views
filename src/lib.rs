@@ -42,6 +42,9 @@
 pub mod materialized;
 
 /// An implementation of Query Rewriting, an optimization that rewrites queries to make use of materialized views.
+///
+/// The implementation is based heavily on [this paper](https://dsg.uwaterloo.ca/seminars/notes/larson-paper.pdf),
+/// *Optimizing Queries Using Materialized Views: A Practical, Scalable Solution*.
 pub mod rewrite;
 
 /// Configuration options for materialized view related features.
