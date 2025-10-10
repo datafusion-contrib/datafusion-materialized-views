@@ -15,6 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/*!
+
+This module implements a dependency analysis algorithm for materialized views, heavily based on the [`ListingTableLike`](super::ListingTableLike) trait.
+Note that materialized views may depend on tables that are not `ListingTableLike`, as long as they have custom metadata explicitly installed
+into the [`RowMetadataRegistry`]. However, materialized views themself must implement `ListingTableLike`, as is
+implied by the type bound `Materialized: ListingTableLike`.
+
+The dependency analysis in a nutshell involves analyzing the fragment of the materialized view's logical plan corresponding to
+partition columns (or row metadata columns more generally). This logical fragment is then used to generate a dependency graph between physical partitions
+of the materialized view and its source tables. This gives rise to two natural phases of the algorithm:
+1. **Inexact Projection Pushdown**: We aggressively prune the logical plan to only include partition columns (or row metadata columns more generally) of the materialized view and its sources.
+   This is similar to pushing down a top-level projection on the materialized view's partition columns. However, "inexact" means that we do not preserve duplicates, order,
+   or even set equality of the original query.
+   * Formally, let P be the (exact) projection operator. If A is the original plan and A' is the result of "inexact" projection pushdown, we have PA ⊆ A'.
+   * This means that in the final output, we may have dependencies that do not exist in the original query. However, we will never miss any dependencies.
+2. **Dependency Graph Construction**: Once we have the pruned logical plan, we can construct a dependency graph between the physical partitions of the materialized view and its sources.
+   After step 1, every table scan only contains row metadata columns, so we replace the table scan with an equivalent scan to a [`RowMetadataSource`](super::row_metadata::RowMetadataSource)
+   This operation also is not duplicate or order preserving. Then, additional metadata is "pushed up" through the plan to the root, where it can be unnested to give a list of source files for each output row.
+   The output rows are then transformed into object storage paths to generate the final graph.
+
+The transformation is complex, and we give a full walkthrough in the documentation for [`mv_dependencies_plan`].
+ */
+
 use datafusion::{
     catalog::{CatalogProviderList, TableFunctionImpl},
     config::{CatalogOptions, ConfigOptions},
@@ -252,8 +275,86 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
     }
 }
 
+#[cfg_attr(doc, aquamarine::aquamarine)]
 /// Returns a logical plan that, when executed, lists expected build targets
 /// for this materialized view, together with the dependencies for each target.
+///
+/// See the [module documentation](super) for an overview of the algorithm.
+///
+/// # Example
+///
+/// We explain in detail how the dependency analysis works in an example. Consider the following SQL query, which computes daily
+/// close prices of a stock from its trades, together with the settlement price from a daily statistics table:
+///
+/// ```sql
+/// SELECT
+///     ticker,
+///     LAST_VALUE(trades.price) AS close,
+///     LAST_VALUE(daily_statistics.settlement_price) AS settlement_price,
+///     trades.date AS date
+/// FROM trades
+/// JOIN daily_statistics ON
+///     trades.ticker = daily_statistics.ticker AND
+///     trades.date = daily_statistics.reference_date AND
+///     daily_statistics.date BETWEEN trades.date AND trades.date + INTERVAL 2 WEEKS
+/// GROUP BY ticker, date
+/// ```
+///
+/// Assume that both tables are partitioned by `date` only. We desired a materialized view partitioned by `date` and stored at `s3://daily_close/`.
+/// This query gives us the following logical plan:
+///
+/// ```mermaid
+/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
+/// graph TD
+///     A["Projection: <br>ticker, LAST_VALUE(trades.price) AS close, LAST_VALUE(daily_statistics.settlement_price) AS settlement_price, <mark>trades.date AS date</mark>"]
+///     A --> B["Aggregate: <br>expr=[LAST_VALUE(trades.price), LAST_VALUE(daily_statistics.settlement_price)] <br>groupby=[ticker, <mark>trades.date</mark>]"]
+///     B --> C["Inner Join: <br>trades.ticker = daily_statistics.ticker AND <br>trades.date = daily_statistics.reference_date AND <br><mark>daily_statistics.date BETWEEN trades.date AND trades.date + INTERVAL 2 WEEKS</mark>"]
+///     C --> D["TableScan: trades <br>projection=[ticker, price, <mark>date</mark>]"]
+///     C --> E["TableScan: daily_statistics <br>projection=[ticker, settlement_price, reference_date, <mark>date</mark>]"]
+/// ```
+///
+/// All partition-column-derived expressions are marked in yellow. We now proceed with **Inexact Projection Pushdown**, and prune all unmarked expressions, resulting in the following plan:
+///
+/// ```mermaid
+/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
+/// graph TD
+///     A["Projection: trades.date AS date"]
+///     A --> B["Projection: trades.date"]
+///     B --> C["Inner Join: <br>daily_statistics.date BETWEEN trades.date AND trades.date + INTERVAL 2 WEEKS"]
+///     C --> D["TableScan: trades (projection=[date])"]
+///     C --> E["TableScan: daily_statistics (projection=[date])"]
+/// ```
+///
+/// Note that the `Aggregate` node was converted into a projection. This is valid because we do not need to preserve duplicate rows. However, it does imply that
+/// we cannot partition the materialized view on aggregate expressions.
+///
+/// Now we substitute all scans with equivalent row metadata scans (up to addition or removal of duplicates), and push up the row metadata to the root of the plan,
+/// together with the target path constructed from the (static) partition columns. This gives us the following plan:
+///
+/// ```mermaid
+/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
+/// graph TD
+///     A["Projection: concat('s3://daily_close/date=', date::string, '/') AS target, __meta"]
+///     A --> B["Projection: __meta, trades.date AS date"]
+///     B --> C["Projection: <br>concat(trades_meta.__meta, daily_statistics_meta.__meta) AS __meta, date"]
+///     C --> D["Inner Join: <br><b>daily_statistics_meta</b>.date BETWEEN <b>trades_meta</b>.date AND <b>trades_meta</b>.date + INTERVAL 2 WEEKS"]
+///     D --> E["TableScan: <b>trades_meta</b> (projection=[__meta, date])"]
+///     D --> F["TableScan: <b>daily_statistics_meta</b> (projection=[__meta, date])"]
+/// ```
+///
+/// Here, `__meta` is a column containing a list of structs with the row metadata for each source file. The final query has this struct column
+/// unnested into its components. The final output looks roughly like this:
+///
+/// ```text
+/// +-----------------------------------+----------------------+---------------------+-------------------+-------------------------------------------------------+----------------------+
+/// | target                            | source_table_catalog | source_table_schema | source_table_name | source_uri                                            | source_last_modified |
+/// +-----------------------------------+----------------------+---------------------+-------------------+-------------------------------------------------------+----------------------+
+/// | s3://daily_close/date=2023-01-01/ | datafusion           | public              | trades            | s3://trades/date=2023-01-01/data.01.parquet           | 2023-07-11T16:29:26  |
+/// | s3://daily_close/date=2023-01-01/ | datafusion           | public              | daily_statistics  | s3://daily_statistics/date=2023-01-07/data.01.parquet | 2023-07-11T16:45:22  |
+/// | s3://daily_close/date=2023-01-02/ | datafusion           | public              | trades            | s3://trades/date=2023-01-02/data.01.parquet           | 2023-07-11T16:45:44  |
+/// | s3://daily_close/date=2023-01-02/ | datafusion           | public              | daily_statistics  | s3://daily_statistics/date=2023-01-07/data.01.parquet | 2023-07-11T16:46:10  |
+/// +-----------------------------------+----------------------+---------------------+-------------------+-------------------------------------------------------+----------------------+
+/// ```
 pub fn mv_dependencies_plan(
     materialized_view: &dyn Materialized,
     row_metadata_registry: &RowMetadataRegistry,

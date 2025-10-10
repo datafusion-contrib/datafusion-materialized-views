@@ -17,8 +17,6 @@
 
 use datafusion::{common::extensions_options, config::ConfigExtension};
 
-/// Implements a query rewriting optimizer, also known as "view exploitation"
-/// in some academic sources.
 pub mod exploitation;
 
 pub mod normal_form;
