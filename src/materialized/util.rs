@@ -21,6 +21,7 @@ use datafusion::catalog::{CatalogProviderList, TableProvider};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_sql::ResolvedTableReference;
 
+/// Retrieves a table from the catalog list given a resolved table reference.
 pub fn get_table(
     catalog_list: &dyn CatalogProviderList,
     table_ref: &ResolvedTableReference,
@@ -35,6 +36,7 @@ pub fn get_table(
 
     // NOTE: this is bad, we are calling async code in a sync context.
     // We should file an issue about async in UDTFs.
+    // See: https://github.com/apache/datafusion/issues/17663
     futures::executor::block_on(schema.table(table_ref.table.as_ref()))
         .map_err(|e| e.context(format!("couldn't get table '{}'", table_ref.table)))?
         .ok_or_else(|| DataFusionError::Plan(format!("no such table {}", table_ref.schema)))

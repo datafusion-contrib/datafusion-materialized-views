@@ -62,7 +62,8 @@ use crate::materialized::META_COLUMN;
 
 use super::{cast_to_materialized, row_metadata::RowMetadataRegistry, util, Materialized};
 
-/// A table function that shows build targets and dependencies for a materialized view:
+/// A table function that, for a given materialized view, lists all the output data objects (build targets)
+/// generated during its construction or refresh, as well as all the source data objects (dependencies) it relies on.
 ///
 /// ```ignore
 /// fn mv_dependencies(table_ref: Utf8) -> Table
