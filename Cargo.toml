@@ -29,19 +29,19 @@ rust-version = "1.85.1"
 
 [dependencies]
 aquamarine = "0.6.0"
-arrow = "56.0.0"
-arrow-schema = "56.0.0"
+arrow = "57.0.0"
+arrow-schema = "57.0.0"
 async-trait = "0.1.89"
 dashmap = "6"
-datafusion = "50"
-datafusion-common = "50"
-datafusion-expr = "50"
-datafusion-functions = "50"
-datafusion-functions-aggregate = "50"
-datafusion-optimizer = "50"
-datafusion-physical-expr = "50"
-datafusion-physical-plan = "50"
-datafusion-sql = "50"
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-functions = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", rev = "d679b3b" }
 futures = "0.3"
 itertools = "0.14"
 log = "0.4"

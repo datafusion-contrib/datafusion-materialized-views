@@ -1099,7 +1099,7 @@ mod test {
         assert_eq!(rewritten.schema().as_ref(), query_plan.schema().as_ref());
 
         let expected = concat_batches(
-            &query_plan.schema().as_ref().clone().into(),
+            &query_plan.schema().inner().clone(),
             &context
                 .execute_logical_plan(query_plan)
                 .await?
@@ -1108,7 +1108,7 @@ mod test {
         )?;
 
         let result = concat_batches(
-            &rewritten.schema().as_ref().clone().into(),
+            &rewritten.schema().inner().clone(),
             &context
                 .execute_logical_plan(rewritten)
                 .await?

@@ -32,7 +32,9 @@ use datafusion::{
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_common::{Constraints, DataFusionError, ParamValues, ScalarValue, Statistics};
+use datafusion_common::{
+    metadata::ScalarAndMetadata, Constraints, DataFusionError, ParamValues, ScalarValue, Statistics,
+};
 use datafusion_expr::{
     col, dml::InsertOp, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr,
     TableProviderFilterPushDown, TableType,
@@ -550,7 +552,7 @@ impl TableProvider for MaterializedListingTable {
 fn parse_partition_values(
     path: &ObjectPath,
     partition_columns: &[(String, DataType)],
-) -> Result<Vec<ScalarValue>, DataFusionError> {
+) -> Result<Vec<ScalarAndMetadata>, DataFusionError> {
     let parts = path.parts().map(|part| part.to_owned()).collect::<Vec<_>>();
 
     let pairs = parts
@@ -562,7 +564,7 @@ fn parse_partition_values(
         .iter()
         .map(|(column, datatype)| {
             let value = pairs.get(column.as_str()).copied().map(String::from);
-            ScalarValue::Utf8(value).cast_to(datatype)
+            ScalarAndMetadata::from(ScalarValue::Utf8(value)).cast_storage_to(datatype)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
