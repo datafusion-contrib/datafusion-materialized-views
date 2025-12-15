@@ -527,8 +527,8 @@ impl Predicate {
             // so handling of open intervals is done by adding/subtracting the smallest increment.
             // However, there is not really a public API to do this,
             // other than the satisfy_greater method.
-            Operator::Lt => Ok(
-                match satisfy_greater(
+            Operator::Lt => {
+                let range_val = match satisfy_greater(
                     &Interval::try_new(value.clone(), value.clone())?,
                     &Interval::make_unbounded(&value.data_type())?,
                     true,
@@ -538,11 +538,19 @@ impl Predicate {
                         *range = None;
                         return Ok(());
                     }
-                },
-            ),
-            // Same thing as above.
-            Operator::Gt => Ok(
-                match satisfy_greater(
+                };
+                // If the type is not discrete (e.g. Utf8), satisfy_greater may return an unchanged value.
+                // This means the interval could not be tightened and it is unsafe to produce a closed interval
+                if range_val.upper() == &value {
+                    Err(DataFusionError::Plan(
+                        "cannot represent strict inequality as closed interval for non-discrete types".to_string(),
+                    ))
+                } else {
+                    Ok(range_val)
+                }
+            }
+            Operator::Gt => {
+                let range_val = match satisfy_greater(
                     &Interval::make_unbounded(&value.data_type())?,
                     &Interval::try_new(value.clone(), value.clone())?,
                     true,
@@ -552,8 +560,15 @@ impl Predicate {
                         *range = None;
                         return Ok(());
                     }
-                },
-            ),
+                };
+                if range_val.lower() == &value {
+                    Err(DataFusionError::Plan(
+                        "cannot represent strict inequality as closed interval for non-discrete types".to_string(),
+                    ))
+                } else {
+                    Ok(range_val)
+                }
+            }
             _ => Err(DataFusionError::Plan(
                 "unsupported binary expression".to_string(),
             )),
@@ -1153,6 +1168,11 @@ mod test {
                 // Since column1 = column3 in the original view,
                 // we are allowed to substitute column1 for column3 and vice versa.
                     "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
+            },
+            TestCase {
+                name: "range filter with inequality on non-discrete type",
+                base: "SELECT * FROM t1",
+                query: "SELECT column1 FROM t1 WHERE column1 < '2022'",
             },
             TestCase {
                 name: "duplicate expressions (X-209)",
