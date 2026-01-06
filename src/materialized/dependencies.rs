@@ -860,7 +860,7 @@ fn project_dfschema(schema: &DFSchema, indices: &HashSet<usize>) -> Result<DFSch
         .filter_map(|i| {
             indices.contains(&i).then_some({
                 let (reference, field) = schema.qualified_field(i);
-                (reference.cloned(), Arc::new(field.clone()))
+                (reference.cloned(), field.clone())
             })
         })
         .collect_vec();

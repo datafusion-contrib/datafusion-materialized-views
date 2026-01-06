@@ -718,11 +718,11 @@ impl Predicate {
                 Some(range) => range,
             };
 
-            if other_range.contains(range)? != Interval::CERTAINLY_TRUE {
+            if other_range.contains(range)? != Interval::TRUE {
                 return Ok(None);
             }
 
-            if range.contains(other_range)? != Interval::CERTAINLY_TRUE {
+            if range.contains(other_range)? != Interval::TRUE {
                 if !(range.lower().is_null() || range.upper().is_null())
                     && (range.lower().eq(range.upper()))
                 {
