@@ -233,22 +233,11 @@ impl SpjNormalForm {
             .map(|expr| predicate.normalize_expr(expr))
             .collect();
 
-        let mut referenced_tables = vec![];
-        original_plan
-            .apply(|plan| {
-                if let LogicalPlan::TableScan(scan) = plan {
-                    referenced_tables.push(scan.table_name.clone());
-                }
-
-                Ok(TreeNodeRecursion::Continue)
-            })
-            // No chance of error since we never return Err -- this unwrap is safe
-            .unwrap();
-
         Ok(Self {
             output_schema: Arc::clone(original_plan.schema()),
             output_exprs,
-            referenced_tables,
+            // Reuse referenced_tables collected during Predicate::new to avoid extra traversal
+            referenced_tables: predicate.referenced_tables.clone(),
             predicate,
         })
     }
@@ -344,83 +333,94 @@ struct Predicate {
     ranges_by_equivalence_class: Vec<Option<Interval>>,
     /// Filter expressions that aren't column equality predicates or range filters.
     residuals: HashSet<Expr>,
+    /// Tables referenced in this plan (collected during single-pass traversal)
+    referenced_tables: Vec<TableReference>,
 }
 
 impl Predicate {
+    /// Create a new Predicate by analyzing the given logical plan.
+    /// Uses single-pass traversal to collect schema, columns, filters, and referenced tables.
     fn new(plan: &LogicalPlan) -> Result<Self> {
         let mut schema = DFSchema::empty();
-        plan.apply(|plan| {
-            if let LogicalPlan::TableScan(scan) = plan {
-                let new_schema = DFSchema::try_from_qualified_schema(
-                    scan.table_name.clone(),
-                    scan.source.schema().as_ref(),
-                )?;
-                schema = if schema.fields().is_empty() {
-                    new_schema
-                } else {
-                    schema.join(&new_schema)?
+        let mut columns_info: Vec<(Column, arrow::datatypes::DataType)> = Vec::new();
+        let mut filters: Vec<Expr> = Vec::new();
+        let mut referenced_tables: Vec<TableReference> = Vec::new();
+
+        // Single traversal to collect everything
+        plan.apply(|node| {
+            match node {
+                LogicalPlan::TableScan(scan) => {
+                    // Collect referenced table
+                    referenced_tables.push(scan.table_name.clone());
+
+                    // Build schema
+                    let new_schema = DFSchema::try_from_qualified_schema(
+                        scan.table_name.clone(),
+                        scan.source.schema().as_ref(),
+                    )?;
+
+                    // Collect columns with their data types
+                    for (table_ref, field) in new_schema.iter() {
+                        columns_info.push((
+                            Column::new(table_ref.cloned(), field.name()),
+                            field.data_type().clone(),
+                        ));
+                    }
+
+                    // Merge schema
+                    schema = if schema.fields().is_empty() {
+                        new_schema
+                    } else {
+                        schema.join(&new_schema)?
+                    };
+
+                    // Collect filters from TableScan
+                    filters.extend(scan.filters.iter().cloned());
                 }
-            }
-
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        let mut new = Self {
-            schema,
-            eq_classes: vec![],
-            eq_class_idx_by_column: HashMap::default(),
-            ranges_by_equivalence_class: vec![],
-            residuals: HashSet::new(),
-        };
-
-        // Collect all referenced columns
-        plan.apply(|plan| {
-            if let LogicalPlan::TableScan(scan) = plan {
-                for (i, (table_ref, field)) in DFSchema::try_from_qualified_schema(
-                    scan.table_name.clone(),
-                    scan.source.schema().as_ref(),
-                )?
-                .iter()
-                .enumerate()
-                {
-                    let column = Column::new(table_ref.cloned(), field.name());
-                    let data_type = field.data_type();
-                    new.eq_classes
-                        .push(ColumnEquivalenceClass::new_singleton(column.clone()));
-                    new.eq_class_idx_by_column.insert(column, i);
-                    new.ranges_by_equivalence_class
-                        .push(Some(Interval::make_unbounded(data_type)?));
+                LogicalPlan::Filter(filter) => {
+                    filters.push(filter.predicate.clone());
                 }
-            }
-
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-
-        // Collect any filters
-        plan.apply(|plan| {
-            let filters = match plan {
-                LogicalPlan::TableScan(scan) => scan.filters.as_slice(),
-                LogicalPlan::Filter(filter) => core::slice::from_ref(&filter.predicate),
                 LogicalPlan::Join(_join) => {
                     return Err(DataFusionError::Internal(
                         "joins are not supported yet".to_string(),
-                    ))
+                    ));
                 }
-                LogicalPlan::Projection(_) => &[],
+                LogicalPlan::Projection(_) => {}
                 _ => {
                     return Err(DataFusionError::Plan(format!(
                         "unsupported logical plan: {}",
-                        plan.display()
-                    )))
+                        node.display()
+                    )));
                 }
-            };
-
-            for expr in filters.iter().flat_map(split_conjunction) {
-                new.insert_conjuct(expr)?;
             }
-
             Ok(TreeNodeRecursion::Continue)
         })?;
+
+        // Initialize data structures with known capacity
+        let n = columns_info.len();
+        let mut eq_classes = Vec::with_capacity(n);
+        let mut eq_class_idx_by_column = HashMap::with_capacity(n);
+        let mut ranges_by_equivalence_class = Vec::with_capacity(n);
+
+        for (i, (column, data_type)) in columns_info.into_iter().enumerate() {
+            eq_classes.push(ColumnEquivalenceClass::new_singleton(column.clone()));
+            eq_class_idx_by_column.insert(column, i);
+            ranges_by_equivalence_class.push(Some(Interval::make_unbounded(&data_type)?));
+        }
+
+        let mut new = Self {
+            schema,
+            eq_classes,
+            eq_class_idx_by_column,
+            ranges_by_equivalence_class,
+            residuals: HashSet::new(),
+            referenced_tables,
+        };
+
+        // Process all collected filters
+        for expr in filters.iter().flat_map(split_conjunction) {
+            new.insert_conjuct(expr)?;
+        }
 
         Ok(new)
     }
@@ -1163,11 +1163,11 @@ mod test {
             TestCase {
                 name: "range filter + equality predicate",
                 base:
-                    "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
+                "SELECT column1, column2 FROM t1 WHERE column1 = column3 AND column1 >= '2022'",
                 query:
                 // Since column1 = column3 in the original view,
                 // we are allowed to substitute column1 for column3 and vice versa.
-                    "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
+                "SELECT column2, column3 FROM t1 WHERE column1 = column3 AND column3 >= '2023'",
             },
             TestCase {
                 name: "range filter with inequality on non-discrete type",
