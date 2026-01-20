@@ -397,10 +397,10 @@ impl Predicate {
         })?;
 
         // Initialize data structures with known capacity
-        let n = columns_info.len();
-        let mut eq_classes = Vec::with_capacity(n);
-        let mut eq_class_idx_by_column = HashMap::with_capacity(n);
-        let mut ranges_by_equivalence_class = Vec::with_capacity(n);
+        let num_columns = columns_info.len();
+        let mut eq_classes = Vec::with_capacity(num_columns);
+        let mut eq_class_idx_by_column = HashMap::with_capacity(num_columns);
+        let mut ranges_by_equivalence_class = Vec::with_capacity(num_columns);
 
         for (i, (column, data_type)) in columns_info.into_iter().enumerate() {
             eq_classes.push(ColumnEquivalenceClass::new_singleton(column.clone()));
@@ -1226,6 +1226,95 @@ mod test {
             println!("executing test: {}", case.name);
             run_test(&case).await.map_err(|e| e.context(case.name))?;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_predicate_new_collects_expected_data() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        // Create a table with known schema
+        ctx.sql(
+            "CREATE TABLE test_table (
+                col1 INT,
+                col2 VARCHAR,
+                col3 DOUBLE
+            )",
+        )
+        .await?
+        .collect()
+        .await?;
+
+        // Create a plan with filters
+        let plan = ctx
+            .sql("SELECT col1, col2 FROM test_table WHERE col1 >= 10 AND col2 = col3")
+            .await?
+            .into_optimized_plan()?;
+
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Verify referenced_tables is collected
+        assert_eq!(normal_form.referenced_tables().len(), 1);
+        assert_eq!(normal_form.referenced_tables()[0].to_string(), "test_table");
+
+        // Verify output_exprs matches the projection (2 columns)
+        assert_eq!(normal_form.output_exprs().len(), 2);
+
+        // Verify schema is preserved
+        assert_eq!(normal_form.output_schema().fields().len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_predicate_new_with_multiple_tables() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        ctx.sql("CREATE TABLE t1 (a INT, b INT)")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql("CREATE TABLE t2 (c INT, d INT)")
+            .await?
+            .collect()
+            .await?;
+
+        // Note: Join is not supported yet, so we test with a single table
+        // This test verifies the single-pass traversal works correctly
+        let plan = ctx
+            .sql("SELECT a, b FROM t1 WHERE a >= 0 AND b <= 100")
+            .await?
+            .into_optimized_plan()?;
+
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Verify data collection
+        assert_eq!(normal_form.referenced_tables().len(), 1);
+        assert_eq!(normal_form.output_exprs().len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_predicate_new_with_range_filters() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        ctx.sql("CREATE TABLE range_test (x INT, y INT, z VARCHAR)")
+            .await?
+            .collect()
+            .await?;
+
+        let plan = ctx
+            .sql("SELECT * FROM range_test WHERE x >= 10 AND x <= 100 AND y = 50")
+            .await?
+            .into_optimized_plan()?;
+
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Verify all columns are in output
+        assert_eq!(normal_form.output_exprs().len(), 3);
+        assert_eq!(normal_form.referenced_tables().len(), 1);
 
         Ok(())
     }
