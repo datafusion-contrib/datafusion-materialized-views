@@ -1268,7 +1268,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_predicate_new_with_multiple_tables() -> Result<()> {
+    async fn test_predicate_new_with_join_returns_error() -> Result<()> {
         let ctx = SessionContext::new();
 
         ctx.sql("CREATE TABLE t1 (a INT, b INT)")
@@ -1280,18 +1280,20 @@ mod test {
             .collect()
             .await?;
 
-        // Note: Join is not supported yet, so we test with a single table
-        // This test verifies the single-pass traversal works correctly
+        // Test that join returns an error as it's not supported yet
         let plan = ctx
-            .sql("SELECT a, b FROM t1 WHERE a >= 0 AND b <= 100")
+            .sql("SELECT t1.a, t2.d FROM t1 JOIN t2 ON t1.b = t2.c WHERE t1.a >= 0 AND t2.d <= 100")
             .await?
             .into_optimized_plan()?;
 
-        let normal_form = SpjNormalForm::new(&plan)?;
+        let result = SpjNormalForm::new(&plan);
 
-        // Verify data collection
-        assert_eq!(normal_form.referenced_tables().len(), 1);
-        assert_eq!(normal_form.output_exprs().len(), 2);
+        // Verify that join returns an error
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("joins are not supported yet"));
 
         Ok(())
     }
