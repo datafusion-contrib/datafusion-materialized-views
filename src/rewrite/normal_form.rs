@@ -247,32 +247,50 @@ impl SpjNormalForm {
     /// This is useful for rewriting queries to use materialized views.
     pub fn rewrite_from(
         &self,
-        mut other: &Self,
+        other: &Self,
         qualifier: TableReference,
         source: Arc<dyn TableSource>,
     ) -> Result<Option<LogicalPlan>> {
         log::trace!("rewriting from {qualifier}");
+
+        // Cache columns() result to avoid repeated Vec allocation in the loop.
+        // DFSchema::columns() creates a new Vec on each call.
+        let output_columns = self.output_schema.columns();
+
         let mut new_output_exprs = Vec::with_capacity(self.output_exprs.len());
         // check that our output exprs are sub-expressions of the other one's output exprs
         for (i, output_expr) in self.output_exprs.iter().enumerate() {
-            let new_output_expr = other
-                .predicate
-                .normalize_expr(output_expr.clone())
-                .rewrite(&mut other)?
-                .data;
+            // Fast path for simple Column expressions (most common case).
+            // This avoids the expensive normalize_expr transform for columns.
+            let new_output_expr = if let Expr::Column(col) = output_expr {
+                let normalized_col = other.predicate.normalize_column(col);
+                match other.find_output_column(&normalized_col) {
+                    Some(rewritten) => rewritten,
+                    None => return Ok(None), // Column not found, can't rewrite
+                }
+            } else {
+                // Slow path: complex expressions need full transform
+                let new_output_expr = other
+                    .predicate
+                    .normalize_expr(output_expr.clone())
+                    .rewrite(&mut &*other)?
+                    .data;
 
-            // Check that all references to the original tables have been replaced.
-            // All remaining column expressions should be unqualified, which indicates
-            // that they refer to the output of the sub-plan (in this case the view)
-            if new_output_expr
-                .column_refs()
-                .iter()
-                .any(|c| c.relation.is_some())
-            {
-                return Ok(None);
-            }
+                // Check that all references to the original tables have been replaced.
+                // All remaining column expressions should be unqualified, which indicates
+                // that they refer to the output of the sub-plan (in this case the view)
+                if new_output_expr
+                    .column_refs()
+                    .iter()
+                    .any(|c| c.relation.is_some())
+                {
+                    return Ok(None);
+                }
+                new_output_expr
+            };
 
-            let column = &self.output_schema.columns()[i];
+            // Use cached columns instead of calling .columns() on each iteration
+            let column = &output_columns[i];
             new_output_exprs.push(
                 new_output_expr.alias_qualified(column.relation.clone(), column.name.clone()),
             );
@@ -299,7 +317,7 @@ impl SpjNormalForm {
             .into_iter()
             .chain(range_filters)
             .chain(residual_filters)
-            .map(|expr| expr.rewrite(&mut other).unwrap().data)
+            .map(|expr| expr.rewrite(&mut &*other).unwrap().data)
             .reduce(|a, b| a.and(b));
 
         if all_filters
@@ -317,6 +335,20 @@ impl SpjNormalForm {
         }
 
         builder.project(new_output_exprs)?.build().map(Some)
+    }
+
+    /// Fast path: find a column in output_exprs and return rewritten expression.
+    /// This avoids full tree traversal for simple column lookups.
+    #[inline]
+    fn find_output_column(&self, col: &Column) -> Option<Expr> {
+        self.output_exprs
+            .iter()
+            .position(|e| matches!(e, Expr::Column(c) if c == col))
+            .map(|idx| {
+                Expr::Column(Column::new_unqualified(
+                    self.output_schema.field(idx).name().clone(),
+                ))
+            })
     }
 }
 
@@ -429,6 +461,17 @@ impl Predicate {
         self.eq_class_idx_by_column
             .get(col)
             .and_then(|&idx| self.eq_classes.get(idx))
+    }
+
+    /// Fast path: normalize a single Column without full tree traversal.
+    /// This is O(1) lookup instead of O(n) transform.
+    #[inline]
+    fn normalize_column(&self, col: &Column) -> Column {
+        if let Some(eq_class) = self.class_for_column(col) {
+            eq_class.columns.first().unwrap().clone()
+        } else {
+            col.clone()
+        }
     }
 
     /// Add a new column equivalence
@@ -792,6 +835,11 @@ impl Predicate {
     /// Rewrite all expressions in terms of their normal representatives
     /// with respect to this predicate's equivalence classes.
     fn normalize_expr(&self, e: Expr) -> Expr {
+        // Fast path: if it's a simple Column, avoid full transform traversal
+        if let Expr::Column(ref c) = e {
+            return Expr::Column(self.normalize_column(c));
+        }
+
         e.transform(&|e| {
             let c = match e {
                 Expr::Column(c) => c,
