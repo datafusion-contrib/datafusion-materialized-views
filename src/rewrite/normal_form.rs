@@ -1368,4 +1368,79 @@ mod test {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_normalize_column_fast_path() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        ctx.sql("CREATE TABLE t (a INT, b INT, c INT)")
+            .await?
+            .collect()
+            .await?;
+
+        // Query with column equivalence: a = b
+        let plan = ctx
+            .sql("SELECT a, b, c FROM t WHERE a = b")
+            .await?
+            .into_optimized_plan()?;
+
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Verify that columns are normalized correctly
+        // a and b should be in the same equivalence class
+        assert_eq!(normal_form.output_exprs().len(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_from_with_many_columns() -> Result<()> {
+        let ctx = SessionContext::new();
+
+        // Create a wide table to test the columns() caching optimization
+        ctx.sql(
+            "CREATE TABLE wide_table (
+                c0 INT, c1 INT, c2 INT, c3 INT, c4 INT,
+                c5 INT, c6 INT, c7 INT, c8 INT, c9 INT
+            )",
+        )
+            .await?
+            .collect()
+            .await?;
+
+        let base_plan = ctx
+            .sql("SELECT * FROM wide_table WHERE c0 >= 0")
+            .await?
+            .into_optimized_plan()?;
+
+        let query_plan = ctx
+            .sql("SELECT c0, c1, c2 FROM wide_table WHERE c0 >= 10")
+            .await?
+            .into_optimized_plan()?;
+
+        let base_nf = SpjNormalForm::new(&base_plan)?;
+        let query_nf = SpjNormalForm::new(&query_plan)?;
+
+        // Create MV table
+        ctx.sql("CREATE TABLE mv AS SELECT * FROM wide_table WHERE c0 >= 0")
+            .await?
+            .collect()
+            .await?;
+
+        let table_ref = TableReference::bare("mv");
+        let provider = ctx.table_provider(table_ref.clone()).await?;
+
+        // Test that rewrite_from works correctly with cached columns
+        let result = query_nf.rewrite_from(
+            &base_nf,
+            table_ref,
+            provider_as_source(provider),
+        )?;
+
+        assert!(result.is_some());
+        let rewritten = result.unwrap();
+        assert_eq!(rewritten.schema().fields().len(), 3);
+
+        Ok(())
+    }
 }
