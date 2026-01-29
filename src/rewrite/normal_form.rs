@@ -1404,9 +1404,9 @@ mod test {
                 c5 INT, c6 INT, c7 INT, c8 INT, c9 INT
             )",
         )
-            .await?
-            .collect()
-            .await?;
+        .await?
+        .collect()
+        .await?;
 
         let base_plan = ctx
             .sql("SELECT * FROM wide_table WHERE c0 >= 0")
@@ -1431,11 +1431,7 @@ mod test {
         let provider = ctx.table_provider(table_ref.clone()).await?;
 
         // Test that rewrite_from works correctly with cached columns
-        let result = query_nf.rewrite_from(
-            &base_nf,
-            table_ref,
-            provider_as_source(provider),
-        )?;
+        let result = query_nf.rewrite_from(&base_nf, table_ref, provider_as_source(provider))?;
 
         assert!(result.is_some());
         let rewritten = result.unwrap();
