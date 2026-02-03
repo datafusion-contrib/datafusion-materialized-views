@@ -179,7 +179,7 @@ struct StaleFilesUdtf {
 impl TableFunctionImpl for StaleFilesUdtf {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         use datafusion::prelude::*;
-        use datafusion_functions_aggregate::min_max::{min, max};
+        use datafusion_functions_aggregate::min_max::{max, min};
 
         let dependencies = provider_as_source(self.mv_dependencies.call(args)?);
 
