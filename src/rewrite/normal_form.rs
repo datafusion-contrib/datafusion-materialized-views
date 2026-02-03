@@ -835,7 +835,11 @@ impl Predicate {
     /// Rewrite all expressions in terms of their normal representatives
     /// with respect to this predicate's equivalence classes.
     fn normalize_expr(&self, e: Expr) -> Expr {
-        // Fast path: if it's a simple Column, avoid full transform traversal
+        // Fast path: if it's a simple Column, avoid full transform traversal.
+        // Even though transform() handles Column efficiently, the machinery setup
+        // (closures, iterators, Transformed<T> wrappers) has overhead that adds up
+        // when called thousands of times (e.g., 41 columns × 5-7 MVs × every query).
+        // Direct HashMap lookup + clone is significantly faster.
         if let Expr::Column(ref c) = e {
             return Expr::Column(self.normalize_column(c));
         }
