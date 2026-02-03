@@ -179,7 +179,7 @@ struct StaleFilesUdtf {
 impl TableFunctionImpl for StaleFilesUdtf {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         use datafusion::prelude::*;
-        use datafusion_functions_aggregate::min_max::max;
+        use datafusion_functions_aggregate::min_max::{min, max};
 
         let dependencies = provider_as_source(self.mv_dependencies.call(args)?);
 
@@ -238,7 +238,10 @@ impl TableFunctionImpl for StaleFilesUdtf {
                             )
                             .alias("existing_target"),
                         ],
-                        vec![max(col("last_modified")).alias("target_last_modified")],
+                        // Taking the minimum last_modified timestamp of the target to compare with
+                        // the maximum source_last_modified. If any file in the source is newer than
+                        // any file in the target, the target is potentially stale.
+                        vec![min(col("last_modified")).alias("target_last_modified")],
                     )?
                     .project(vec![col("existing_target"), col("target_last_modified")])?
                     .build()?,
