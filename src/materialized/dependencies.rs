@@ -24,7 +24,7 @@ use datafusion::{
 use datafusion_common::{
     alias::AliasGenerator,
     internal_err,
-    tree_node::{Transformed, TreeNode},
+    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     DFSchema, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::{
@@ -38,6 +38,19 @@ use std::{collections::HashSet, sync::Arc};
 use crate::materialized::META_COLUMN;
 
 use super::{cast_to_materialized, row_metadata::RowMetadataRegistry, util, Materialized};
+
+/// Options for dependency analysis.
+#[derive(Debug, Clone, Default)]
+pub struct DependencyOptions {
+    /// If true, require that all branches of a UNION in the MV query have matching
+    /// field names at each position.
+    ///
+    /// SQL UNION combines results positionally, so branches are permitted to have
+    /// different field names for the same column. Enabling this check ensures that
+    /// UNION branches are semantically consistent, which can catch unintentional
+    /// column misalignment when tracking partition-level dependencies.
+    pub strict_union_schema_names: bool,
+}
 
 /// A table function that shows build targets and dependencies for a materialized view:
 ///
@@ -65,11 +78,13 @@ pub fn mv_dependencies(
     catalog_list: Arc<dyn CatalogProviderList>,
     row_metadata_registry: Arc<RowMetadataRegistry>,
     options: &ConfigOptions,
+    dependency_options: DependencyOptions,
 ) -> Arc<dyn TableFunctionImpl + 'static> {
     Arc::new(FileDependenciesUdtf::new(
         catalog_list,
         row_metadata_registry,
         options,
+        dependency_options,
     ))
 }
 
@@ -78,6 +93,7 @@ struct FileDependenciesUdtf {
     catalog_list: Arc<dyn CatalogProviderList>,
     row_metadata_registry: Arc<RowMetadataRegistry>,
     config_options: ConfigOptions,
+    dependency_options: DependencyOptions,
 }
 
 impl FileDependenciesUdtf {
@@ -85,11 +101,13 @@ impl FileDependenciesUdtf {
         catalog_list: Arc<dyn CatalogProviderList>,
         row_metadata_registry: Arc<RowMetadataRegistry>,
         config_options: &ConfigOptions,
+        dependency_options: DependencyOptions,
     ) -> Self {
         Self {
             catalog_list,
             config_options: config_options.clone(),
             row_metadata_registry,
+            dependency_options,
         }
     }
 }
@@ -115,6 +133,7 @@ impl TableFunctionImpl for FileDependenciesUdtf {
                 mv,
                 self.row_metadata_registry.as_ref(),
                 &self.config_options,
+                &self.dependency_options,
             )?,
             None,
         )))
@@ -135,13 +154,15 @@ pub fn stale_files(
     row_metadata_registry: Arc<RowMetadataRegistry>,
     file_metadata: Arc<dyn TableProvider>,
     config_options: &ConfigOptions,
+    dependency_options: DependencyOptions,
 ) -> Arc<dyn TableFunctionImpl + 'static> {
     Arc::new(StaleFilesUdtf {
-        mv_dependencies: FileDependenciesUdtf {
+        mv_dependencies: FileDependenciesUdtf::new(
             catalog_list,
             row_metadata_registry,
-            config_options: config_options.clone(),
-        },
+            config_options,
+            dependency_options,
+        ),
         file_metadata,
     })
 }
@@ -252,14 +273,44 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
     }
 }
 
+/// Validates that all branches of every UNION node in the plan have the same
+/// field names at each position as the union's output schema.
+fn check_union_schema_names(plan: &LogicalPlan) -> Result<()> {
+    use datafusion_expr::logical_plan::Union;
+    plan.apply(|node| {
+        if let LogicalPlan::Union(Union { inputs, schema }) = node {
+            for (i, field) in schema.fields().iter().enumerate() {
+                for input in inputs.iter() {
+                    let input_name = input.schema().field(i).name();
+                    if input_name != field.name() {
+                        return Err(DataFusionError::Plan(format!(
+                            "strict union schema check failed: field at position {i} \
+                             is '{}' in one branch but '{}' in another",
+                            field.name(),
+                            input_name,
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(())
+}
+
 /// Returns a logical plan that, when executed, lists expected build targets
 /// for this materialized view, together with the dependencies for each target.
 pub fn mv_dependencies_plan(
     materialized_view: &dyn Materialized,
     row_metadata_registry: &RowMetadataRegistry,
     config_options: &ConfigOptions,
+    dependency_options: &DependencyOptions,
 ) -> Result<LogicalPlan> {
     use datafusion_expr::logical_plan::*;
+
+    if dependency_options.strict_union_schema_names {
+        check_union_schema_names(&materialized_view.query())?;
+    }
 
     let plan = materialized_view.query().clone();
 
@@ -974,7 +1025,7 @@ mod test {
         Decorator, ListingTableLike, Materialized,
     };
 
-    use super::{mv_dependencies, stale_files};
+    use super::{mv_dependencies, mv_dependencies_plan, stale_files, DependencyOptions};
 
     /// A mock materialized view.
     #[derive(Debug)]
@@ -1186,6 +1237,7 @@ mod test {
                 Arc::clone(ctx.state().catalog_list()),
                 row_metadata_registry.clone(),
                 ctx.copied_config().options(),
+                DependencyOptions::default(),
             ),
         );
 
@@ -1196,6 +1248,7 @@ mod test {
                 Arc::clone(&row_metadata_registry),
                 metadata_table,
                 ctx.copied_config().options(),
+                DependencyOptions::default(),
             ),
         );
 
@@ -1945,6 +1998,154 @@ mod test {
                 .await
                 .unwrap_or_else(|e| panic!("{} failed: {e}", case.name));
         }
+
+        Ok(())
+    }
+
+    /// Build a `LogicalPlan::Union` directly from two `EmptyRelation` inputs.
+    /// DataFusion's SQL planner normalizes branch column names with alias
+    /// projections, so constructing the node manually is the only way to
+    /// produce a Union whose inputs have genuinely different field names.
+    fn make_union(left_fields: Vec<&str>, right_fields: Vec<&str>) -> Result<LogicalPlan> {
+        use arrow_schema::Schema;
+        use datafusion_expr::logical_plan::Union;
+
+        let make_schema = |names: &[&str]| -> Result<Arc<DFSchema>> {
+            let fields: Vec<_> = names
+                .iter()
+                .map(|&n| Field::new(n, arrow_schema::DataType::Utf8, true))
+                .collect();
+            DFSchema::try_from(Schema::new(fields)).map(Arc::new)
+        };
+
+        let left_schema = make_schema(&left_fields)?;
+        let right_schema = make_schema(&right_fields)?;
+
+        let left = LogicalPlan::EmptyRelation(datafusion_expr::logical_plan::EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::clone(&left_schema),
+        });
+        let right = LogicalPlan::EmptyRelation(datafusion_expr::logical_plan::EmptyRelation {
+            produce_one_row: false,
+            schema: right_schema,
+        });
+
+        Ok(LogicalPlan::Union(Union {
+            inputs: vec![Arc::new(left), Arc::new(right)],
+            schema: left_schema, // output schema = first branch (DataFusion convention)
+        }))
+    }
+
+    #[test]
+    fn test_strict_union_schema_names_matching() -> Result<()> {
+        use super::check_union_schema_names;
+
+        // Both branches have the same field name — check must pass.
+        let plan = make_union(vec!["year"], vec!["year"])?;
+        check_union_schema_names(&plan)
+    }
+
+    #[test]
+    fn test_strict_union_schema_names_mismatched() -> Result<()> {
+        use super::check_union_schema_names;
+
+        // Second branch has `column1` while the output schema says `year`.
+        let plan = make_union(vec!["year"], vec!["column1"])?;
+        let err = check_union_schema_names(&plan).unwrap_err();
+        assert!(
+            err.to_string().contains("strict union schema check failed"),
+            "unexpected error message: {err}"
+        );
+        // Error should name the offending fields.
+        assert!(err.to_string().contains("year"), "{err}");
+        assert!(err.to_string().contains("column1"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_union_schema_names_multi_column_partial_mismatch() -> Result<()> {
+        use super::check_union_schema_names;
+
+        // First column matches, second does not.
+        let plan = make_union(vec!["year", "month"], vec!["year", "day"])?;
+        let err = check_union_schema_names(&plan).unwrap_err();
+        assert!(
+            err.to_string().contains("strict union schema check failed"),
+            "unexpected error message: {err}"
+        );
+        assert!(err.to_string().contains("month"), "{err}");
+        assert!(err.to_string().contains("day"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_union_schema_names_nested_inner_mismatch() -> Result<()> {
+        use super::check_union_schema_names;
+        use datafusion_expr::logical_plan::Union;
+
+        // Outer UNION has matching names (both say `year`),
+        // but wraps an inner UNION whose second branch says `column1`.
+        // The strict check must walk the full plan tree and catch the inner mismatch.
+        let inner = make_union(vec!["year"], vec!["column1"])?;
+        let outer_right = make_union(vec!["year"], vec!["year"])?;
+
+        let outer_schema = inner.schema().clone();
+        let nested = LogicalPlan::Union(Union {
+            inputs: vec![Arc::new(inner), Arc::new(outer_right)],
+            schema: outer_schema,
+        });
+
+        let err = check_union_schema_names(&nested).unwrap_err();
+        assert!(
+            err.to_string().contains("strict union schema check failed"),
+            "unexpected error message: {err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_strict_union_via_mv_dependencies_plan() -> Result<()> {
+        // Verify DependencyOptions.strict_union_schema_names is wired through
+        // mv_dependencies_plan: non-strict passes, strict fails.
+        let ctx = setup().await?;
+
+        let mismatched_query = make_union(vec!["year"], vec!["column1"])?;
+        let mv = MockMaterializedView {
+            table_path: ListingTableUrl::parse("s3://mv/").unwrap(),
+            partition_columns: vec!["year".into()],
+            static_partition_columns: None,
+            query: mismatched_query,
+            file_ext: "parquet",
+        };
+        let row_metadata_registry = {
+            let metadata_table = ctx.table_provider("file_metadata").await?;
+            Arc::new(RowMetadataRegistry::new_with_default_source(Arc::new(
+                ObjectStoreRowMetadataSource::with_file_metadata(metadata_table),
+            )))
+        };
+
+        // Non-strict: must not error on schema name mismatch.
+        mv_dependencies_plan(
+            &mv,
+            &row_metadata_registry,
+            ctx.copied_config().options(),
+            &DependencyOptions::default(),
+        )?;
+
+        // Strict: must reject the mismatched UNION.
+        let err = mv_dependencies_plan(
+            &mv,
+            &row_metadata_registry,
+            ctx.copied_config().options(),
+            &DependencyOptions {
+                strict_union_schema_names: true,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("strict union schema check failed"),
+            "unexpected error message: {err}"
+        );
 
         Ok(())
     }

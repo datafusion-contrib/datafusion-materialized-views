@@ -40,7 +40,7 @@ use datafusion_expr::{
     TableProviderFilterPushDown, TableType,
 };
 use datafusion_materialized_views::materialized::{
-    dependencies::{mv_dependencies, stale_files},
+    dependencies::{mv_dependencies, stale_files, DependencyOptions},
     file_metadata::{DefaultFileMetadataProvider, FileMetadata},
     register_materialized,
     row_metadata::RowMetadataRegistry,
@@ -160,6 +160,7 @@ async fn setup() -> Result<TestContext> {
             Arc::clone(ctx.state().catalog_list()),
             Arc::clone(&row_metadata_registry),
             ctx.state().config_options(),
+            DependencyOptions::default(),
         ),
     );
     ctx.register_udtf(
@@ -169,6 +170,7 @@ async fn setup() -> Result<TestContext> {
             Arc::clone(&row_metadata_registry),
             Arc::clone(&file_metadata) as Arc<dyn TableProvider>,
             ctx.state().config_options(),
+            DependencyOptions::default(),
         ),
     );
 
