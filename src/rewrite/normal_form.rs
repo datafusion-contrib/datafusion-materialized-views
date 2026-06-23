@@ -364,10 +364,17 @@ impl SpjNormalForm {
 /// Stores information on filters from a Select-Project-Join plan.
 ///
 /// Built from the original `LogicalPlan` in [`SpjNormalForm::new`] and
-/// exposed read-only via [`SpjNormalForm::predicate`]. Field accessors
-/// describe the three filter buckets that view matching uses (equality
-/// classes, per-class range intervals, and residuals); see the module
-/// docs for how they participate in the subsumption tests.
+/// exposed read-only via [`SpjNormalForm::predicate`]. Internally it
+/// groups filters into three buckets that the view-matching subsumption
+/// tests consume:
+///
+/// 1. column equivalence classes (`col_a = col_b` chains),
+/// 2. per-class range intervals (e.g. `col_a >= 5`), and
+/// 3. residual filter expressions that don't fit the first two buckets.
+///
+/// The internal fields stay private; consumers can render a human-readable
+/// summary via the [`Display`](std::fmt::Display) impl, or reach for the
+/// underlying `LogicalPlan` if they need raw access.
 #[derive(Debug, Clone)]
 pub struct Predicate {
     /// Full table schema, including all possible columns.
@@ -386,7 +393,13 @@ pub struct Predicate {
 
 /// Renders the predicate as an AND-joined list of filter conditions.
 ///
-/// Three sources are emitted in order:
+/// If any equivalence class has an empty range (stored as `None` after a
+/// `Interval::intersect` collapsed to the empty set), the predicate is
+/// unsatisfiable and renders as a single `FALSE` -- otherwise downstream
+/// consumers would see an unsatisfiable filter as if it had no constraint
+/// at all, which is misleading.
+///
+/// For a satisfiable predicate, three sources are emitted in order:
 /// 1. Pairwise equalities derived from each column equivalence class (e.g.
 ///    `t.a = t.b` for a class `{a, b}`); singleton classes emit nothing.
 /// 2. Narrowed range intervals per equivalence class. Classes whose
@@ -400,28 +413,43 @@ pub struct Predicate {
 /// reach for the underlying logical plan instead.
 impl fmt::Display for Predicate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Any None range means a prior intersection produced the empty set,
+        // i.e. the predicate is unsatisfiable. Bail with FALSE so consumers
+        // don't see an unsatisfiable predicate as "no constraints".
+        if self.ranges_by_equivalence_class.iter().any(|r| r.is_none()) {
+            return write!(f, "FALSE");
+        }
+
         let mut parts: Vec<String> = Vec::new();
 
         for eq_class in &self.eq_classes {
             let mut cols = eq_class.columns.iter();
-            let Some(first) = cols.next() else { continue };
+            let Some(first) = cols.next() else {
+                debug_assert!(false, "empty ColumnEquivalenceClass");
+                continue;
+            };
             for other in cols {
                 parts.push(format!("{first} = {other}"));
             }
         }
 
         for (idx, range) in self.ranges_by_equivalence_class.iter().enumerate() {
+            // None was handled above; this is the satisfiable path only.
             let Some(interval) = range else { continue };
             let Some(eq_class) = self.eq_classes.get(idx) else {
+                debug_assert!(false, "ranges/eq_classes length mismatch at {idx}");
                 continue;
             };
             let Some(col) = eq_class.columns.iter().next() else {
+                debug_assert!(false, "empty ColumnEquivalenceClass at {idx}");
                 continue;
             };
             let Ok(field) = self.schema.field_from_column(col) else {
+                debug_assert!(false, "column {col} missing from predicate schema");
                 continue;
             };
             let Ok(unbounded) = Interval::make_unbounded(field.data_type()) else {
+                debug_assert!(false, "make_unbounded failed for {}", field.data_type());
                 continue;
             };
             if interval == &unbounded {
@@ -960,7 +988,7 @@ impl Predicate {
 /// in place of any other columns in the class.
 /// This normal representative is chosen arbitrarily.
 #[derive(Debug, Clone, Default)]
-pub struct ColumnEquivalenceClass {
+struct ColumnEquivalenceClass {
     // first element is the normal representative of the equivalence class
     columns: BTreeSet<Column>,
 }
@@ -1749,6 +1777,17 @@ mod test {
         assert!(
             rendered.contains("t.a = t.b"),
             "expected equality from class {{a, b}}, got: {rendered}"
+        );
+        // `a >= 5` should narrow the equivalence class range away from
+        // the default unbounded interval, so Display emits the column +
+        // its non-default interval. Match liberally on `t.a` followed by
+        // a literal `5` so we don't depend on the exact `Interval`
+        // Display formatting.
+        let has_range =
+            rendered.contains("t.a") && rendered.contains("in ") && rendered.contains('5');
+        assert!(
+            has_range,
+            "expected a narrowed range constraint from `a >= 5` to appear, got: {rendered}"
         );
         assert!(
             rendered.contains("t.c LIKE"),
