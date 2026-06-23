@@ -167,6 +167,7 @@ As one can see, all compensating filters are included, and the query only uses t
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fmt,
     sync::Arc,
 };
 
@@ -223,6 +224,14 @@ impl SpjNormalForm {
     /// All tables referenced in this plan.
     pub fn referenced_tables(&self) -> &[TableReference] {
         &self.referenced_tables
+    }
+
+    /// The normalized predicate of this plan (column equivalence classes,
+    /// per-class range intervals, and residual filter expressions). Useful
+    /// for surfacing the SPJ normal form via catalog metadata or for
+    /// debugging why view matching does or does not engage on a given query.
+    pub fn predicate(&self) -> &Predicate {
+        &self.predicate
     }
 
     /// Analyze an existing `LogicalPlan` and rewrite it in select-project-join normal form.
@@ -353,8 +362,14 @@ impl SpjNormalForm {
 }
 
 /// Stores information on filters from a Select-Project-Join plan.
+///
+/// Built from the original `LogicalPlan` in [`SpjNormalForm::new`] and
+/// exposed read-only via [`SpjNormalForm::predicate`]. Field accessors
+/// describe the three filter buckets that view matching uses (equality
+/// classes, per-class range intervals, and residuals); see the module
+/// docs for how they participate in the subsumption tests.
 #[derive(Debug, Clone)]
-struct Predicate {
+pub struct Predicate {
     /// Full table schema, including all possible columns.
     schema: DFSchema,
     /// List of column equivalence classes.
@@ -367,6 +382,60 @@ struct Predicate {
     residuals: HashSet<Expr>,
     /// Tables referenced in this plan (collected during single-pass traversal)
     referenced_tables: Vec<TableReference>,
+}
+
+/// Renders the predicate as an AND-joined list of filter conditions.
+///
+/// Three sources are emitted in order:
+/// 1. Pairwise equalities derived from each column equivalence class (e.g.
+///    `t.a = t.b` for a class `{a, b}`); singleton classes emit nothing.
+/// 2. Narrowed range intervals per equivalence class. Classes whose
+///    interval is still the default unbounded interval (no filter applied)
+///    are skipped, so only meaningful constraints surface.
+/// 3. Residual filter expressions, rendered via their `Expr` `Display`
+///    and sorted for deterministic output across runs.
+///
+/// Intended for human inspection / catalog surfacing rather than as a
+/// canonical SQL form -- callers that need the original `Expr`s should
+/// reach for the underlying logical plan instead.
+impl fmt::Display for Predicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts: Vec<String> = Vec::new();
+
+        for eq_class in &self.eq_classes {
+            let mut cols = eq_class.columns.iter();
+            let Some(first) = cols.next() else { continue };
+            for other in cols {
+                parts.push(format!("{first} = {other}"));
+            }
+        }
+
+        for (idx, range) in self.ranges_by_equivalence_class.iter().enumerate() {
+            let Some(interval) = range else { continue };
+            let Some(eq_class) = self.eq_classes.get(idx) else {
+                continue;
+            };
+            let Some(col) = eq_class.columns.iter().next() else {
+                continue;
+            };
+            let Ok(field) = self.schema.field_from_column(col) else {
+                continue;
+            };
+            let Ok(unbounded) = Interval::make_unbounded(field.data_type()) else {
+                continue;
+            };
+            if interval == &unbounded {
+                continue;
+            }
+            parts.push(format!("{col} in {interval}"));
+        }
+
+        let mut residuals: Vec<String> = self.residuals.iter().map(|e| e.to_string()).collect();
+        residuals.sort();
+        parts.extend(residuals);
+
+        write!(f, "{}", parts.join(" AND "))
+    }
 }
 
 impl Predicate {
@@ -891,7 +960,7 @@ impl Predicate {
 /// in place of any other columns in the class.
 /// This normal representative is chosen arbitrarily.
 #[derive(Debug, Clone, Default)]
-struct ColumnEquivalenceClass {
+pub struct ColumnEquivalenceClass {
     // first element is the normal representative of the equivalence class
     columns: BTreeSet<Column>,
 }
@@ -1647,6 +1716,47 @@ mod test {
         assert!(
             rewritten.is_some(),
             "Expected MV with 'enabled = true' to match query with 'enabled'"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_predicate_getter_and_display() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE t (a INT, b INT, c VARCHAR)")
+            .await?
+            .collect()
+            .await?;
+
+        // Residual: `c LIKE 'foo%'` falls outside eq classes / ranges and
+        // should land in `residuals`. The eq `a = b` populates an
+        // equivalence class, and `a >= 5` narrows its range.
+        let plan = ctx
+            .sql("SELECT a FROM t WHERE a = b AND a >= 5 AND c LIKE 'foo%'")
+            .await?
+            .into_optimized_plan()?;
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Getter returns a reference to the same Predicate that drives
+        // subsumption tests internally; callers can stringify or inspect
+        // it for catalog surfacing / debugging.
+        let rendered = normal_form.predicate().to_string();
+
+        // Display output is AND-joined; check each expected fragment
+        // independently because residuals are hash-set ordered before the
+        // internal sort, so positional matching would be brittle.
+        assert!(
+            rendered.contains("t.a = t.b"),
+            "expected equality from class {{a, b}}, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("t.c LIKE"),
+            "expected LIKE residual, got: {rendered}"
+        );
+        assert!(
+            !rendered.is_empty(),
+            "predicate Display should not be empty when filters exist"
         );
 
         Ok(())
