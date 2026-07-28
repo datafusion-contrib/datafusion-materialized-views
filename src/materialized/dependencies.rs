@@ -492,11 +492,7 @@ fn pushdown_projection_inexact(plan: LogicalPlan, indices: &HashSet<usize>) -> R
             )
             .map(LogicalPlan::Filter)
         }
-        LogicalPlan::Window(Window {
-            input,
-            window_expr: _,
-            ..
-        }) => {
+        LogicalPlan::Window(Window { input, .. }) => {
             // Window nodes take their input and append window expressions to the end.
             // If our projection doesn't include window expressions, we can just turn
             // the window into a regular projection.

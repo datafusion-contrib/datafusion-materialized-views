@@ -100,6 +100,12 @@ pub fn cast_to_listing_table(table: &dyn TableProvider) -> Option<&dyn ListingTa
         })
 }
 
+// Re-exported for backward compatibility with downstream code that used
+// to import `RewriteReadiness` from `crate::materialized`. The enum
+// itself lives in `crate::rewrite::readiness` now (see PR #55 review),
+// so all readiness-related types are grouped in one file.
+pub use crate::rewrite::readiness::RewriteReadiness;
+
 /// A hive-partitioned table in object storage that is defined by a user-provided query.
 pub trait Materialized: ListingTableLike {
     /// The query that defines this materialized view.
@@ -117,6 +123,19 @@ pub trait Materialized: ListingTableLike {
     /// The rest of the partition columns are 'dynamic' and their values will be generated at runtime during incremental refresh.
     fn static_partition_columns(&self) -> Vec<String> {
         <Self as ListingTableLike>::partition_columns(self)
+    }
+
+    /// Report whether this MV is currently safe to route queries to. See
+    /// [`RewriteReadiness`] for the semantics of each variant. Consulted by
+    /// [`ViewMatcher`](crate::rewrite::exploitation::ViewMatcher) during LP
+    /// rewrite; `NotReady` MVs are dropped from the candidate set upstream
+    /// of the cost function, so they never win a rewrite.
+    ///
+    /// Default is `Unknown`, which means "include as candidate but the
+    /// cost function decides" — backward-compatible for providers that
+    /// don't distinguish lifecycle states.
+    fn rewrite_readiness(&self) -> RewriteReadiness {
+        RewriteReadiness::Unknown
     }
 }
 
