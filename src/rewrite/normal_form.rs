@@ -167,6 +167,7 @@ As one can see, all compensating filters are included, and the query only uses t
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    fmt,
     sync::Arc,
 };
 
@@ -223,6 +224,14 @@ impl SpjNormalForm {
     /// All tables referenced in this plan.
     pub fn referenced_tables(&self) -> &[TableReference] {
         &self.referenced_tables
+    }
+
+    /// The normalized predicate of this plan (column equivalence classes,
+    /// per-class range intervals, and residual filter expressions). Useful
+    /// for surfacing the SPJ normal form via catalog metadata or for
+    /// debugging why view matching does or does not engage on a given query.
+    pub fn predicate(&self) -> &Predicate {
+        &self.predicate
     }
 
     /// Analyze an existing `LogicalPlan` and rewrite it in select-project-join normal form.
@@ -353,8 +362,21 @@ impl SpjNormalForm {
 }
 
 /// Stores information on filters from a Select-Project-Join plan.
+///
+/// Built from the original `LogicalPlan` in [`SpjNormalForm::new`] and
+/// exposed read-only via [`SpjNormalForm::predicate`]. Internally it
+/// groups filters into three buckets that the view-matching subsumption
+/// tests consume:
+///
+/// 1. column equivalence classes (`col_a = col_b` chains),
+/// 2. per-class range intervals (e.g. `col_a >= 5`), and
+/// 3. residual filter expressions that don't fit the first two buckets.
+///
+/// The internal fields stay private; consumers can render a human-readable
+/// summary via the [`Display`](std::fmt::Display) impl, or reach for the
+/// underlying `LogicalPlan` if they need raw access.
 #[derive(Debug, Clone)]
-struct Predicate {
+pub struct Predicate {
     /// Full table schema, including all possible columns.
     schema: DFSchema,
     /// List of column equivalence classes.
@@ -367,6 +389,81 @@ struct Predicate {
     residuals: HashSet<Expr>,
     /// Tables referenced in this plan (collected during single-pass traversal)
     referenced_tables: Vec<TableReference>,
+}
+
+/// Renders the predicate as an AND-joined list of filter conditions.
+///
+/// If any equivalence class has an empty range (stored as `None` after a
+/// `Interval::intersect` collapsed to the empty set), the predicate is
+/// unsatisfiable and renders as a single `FALSE` -- otherwise downstream
+/// consumers would see an unsatisfiable filter as if it had no constraint
+/// at all, which is misleading.
+///
+/// For a satisfiable predicate, three sources are emitted in order:
+/// 1. Pairwise equalities derived from each column equivalence class (e.g.
+///    `t.a = t.b` for a class `{a, b}`); singleton classes emit nothing.
+/// 2. Narrowed range intervals per equivalence class. Classes whose
+///    interval is still the default unbounded interval (no filter applied)
+///    are skipped, so only meaningful constraints surface.
+/// 3. Residual filter expressions, rendered via their `Expr` `Display`
+///    and sorted for deterministic output across runs.
+///
+/// Intended for human inspection / catalog surfacing rather than as a
+/// canonical SQL form -- callers that need the original `Expr`s should
+/// reach for the underlying logical plan instead.
+impl fmt::Display for Predicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Any None range means a prior intersection produced the empty set,
+        // i.e. the predicate is unsatisfiable. Bail with FALSE so consumers
+        // don't see an unsatisfiable predicate as "no constraints".
+        if self.ranges_by_equivalence_class.iter().any(|r| r.is_none()) {
+            return write!(f, "FALSE");
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+
+        for eq_class in &self.eq_classes {
+            let mut cols = eq_class.columns.iter();
+            let Some(first) = cols.next() else {
+                debug_assert!(false, "empty ColumnEquivalenceClass");
+                continue;
+            };
+            for other in cols {
+                parts.push(format!("{first} = {other}"));
+            }
+        }
+
+        for (idx, range) in self.ranges_by_equivalence_class.iter().enumerate() {
+            // None was handled above; this is the satisfiable path only.
+            let Some(interval) = range else { continue };
+            let Some(eq_class) = self.eq_classes.get(idx) else {
+                debug_assert!(false, "ranges/eq_classes length mismatch at {idx}");
+                continue;
+            };
+            let Some(col) = eq_class.columns.iter().next() else {
+                debug_assert!(false, "empty ColumnEquivalenceClass at {idx}");
+                continue;
+            };
+            let Ok(field) = self.schema.field_from_column(col) else {
+                debug_assert!(false, "column {col} missing from predicate schema");
+                continue;
+            };
+            let Ok(unbounded) = Interval::make_unbounded(field.data_type()) else {
+                debug_assert!(false, "make_unbounded failed for {}", field.data_type());
+                continue;
+            };
+            if interval == &unbounded {
+                continue;
+            }
+            parts.push(format!("{col} in {interval}"));
+        }
+
+        let mut residuals: Vec<String> = self.residuals.iter().map(|e| e.to_string()).collect();
+        residuals.sort();
+        parts.extend(residuals);
+
+        write!(f, "{}", parts.join(" AND "))
+    }
 }
 
 impl Predicate {
@@ -656,6 +753,27 @@ impl Predicate {
     fn insert_binary_expr(&mut self, left: &Expr, op: Operator, right: &Expr) -> Result<()> {
         match (left, op, right) {
             (Expr::Column(c), op, Expr::Literal(v, _)) => {
+                // Normalize boolean expressions to canonical form:
+                // col = false -> NOT col
+                // col != true -> NOT col
+                // col = true -> col
+                // col != false -> col
+                // This ensures semantic equivalence matching (e.g., "active = false" matches "NOT active")
+                if let ScalarValue::Boolean(Some(b)) = v {
+                    match (op, b) {
+                        (Operator::Eq, false) | (Operator::NotEq, true) => {
+                            self.residuals
+                                .insert(Expr::Not(Box::new(Expr::Column(c.clone()))));
+                            return Ok(());
+                        }
+                        (Operator::Eq, true) | (Operator::NotEq, false) => {
+                            self.residuals.insert(Expr::Column(c.clone()));
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
                 if let Err(e) = self.add_range(c, &op, v) {
                     // Add a range can fail in some cases, so just fallthrough
                     log::debug!("failed to add range filter: {e}");
@@ -1440,6 +1558,245 @@ mod test {
         assert!(result.is_some());
         let rewritten = result.unwrap();
         assert_eq!(rewritten.schema().fields().len(), 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_boolean_expression_normalization() -> Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let ctx = SessionContext::new();
+
+        // Create table with boolean column
+        ctx.sql(
+            "CREATE TABLE bool_test (
+            id INT,
+            active BOOLEAN,
+            name VARCHAR
+        )",
+        )
+        .await?
+        .collect()
+        .await?;
+
+        ctx.sql("INSERT INTO bool_test VALUES (1, true, 'a'), (2, false, 'b')")
+            .await?
+            .collect()
+            .await?;
+
+        // MV: uses "active = false"
+        let mv_plan = ctx
+            .sql("SELECT * FROM bool_test WHERE active = false")
+            .await?
+            .into_optimized_plan()?;
+        let mv_normal_form = SpjNormalForm::new(&mv_plan)?;
+
+        ctx.sql("CREATE TABLE mv AS SELECT * FROM bool_test WHERE active = false")
+            .await?
+            .collect()
+            .await?;
+
+        // Query: uses "NOT active" (semantically equivalent to "active = false")
+        let query_plan = ctx
+            .sql("SELECT id, name FROM bool_test WHERE NOT active")
+            .await?
+            .into_optimized_plan()?;
+        let query_normal_form = SpjNormalForm::new(&query_plan)?;
+
+        let table_ref = TableReference::bare("mv");
+        let rewritten = query_normal_form.rewrite_from(
+            &mv_normal_form,
+            table_ref.clone(),
+            provider_as_source(ctx.table_provider(table_ref).await?),
+        )?;
+
+        assert!(
+            rewritten.is_some(),
+            "Expected MV with 'active = false' to match query with 'NOT active'"
+        );
+
+        // Also test the reverse: MV with "NOT active", query with "active = false"
+        let mv_plan2 = ctx
+            .sql("SELECT * FROM bool_test WHERE NOT active")
+            .await?
+            .into_optimized_plan()?;
+        let mv_normal_form2 = SpjNormalForm::new(&mv_plan2)?;
+
+        ctx.sql("CREATE TABLE mv2 AS SELECT * FROM bool_test WHERE NOT active")
+            .await?
+            .collect()
+            .await?;
+
+        let query_plan2 = ctx
+            .sql("SELECT id FROM bool_test WHERE active = false")
+            .await?
+            .into_optimized_plan()?;
+        let query_normal_form2 = SpjNormalForm::new(&query_plan2)?;
+
+        let table_ref2 = TableReference::bare("mv2");
+        let rewritten2 = query_normal_form2.rewrite_from(
+            &mv_normal_form2,
+            table_ref2.clone(),
+            provider_as_source(ctx.table_provider(table_ref2).await?),
+        )?;
+
+        assert!(
+            rewritten2.is_some(),
+            "Expected MV with 'NOT active' to match query with 'active = false'"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_boolean_column_normalization() -> Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let ctx = SessionContext::new();
+
+        ctx.sql(
+            "CREATE TABLE bool_test (
+            id INT,
+            active BOOLEAN,
+            name VARCHAR
+        )",
+        )
+        .await?
+        .collect()
+        .await?;
+
+        // Test: MV with "active = false" should match query with "NOT active"
+        let mv_plan = ctx
+            .sql("SELECT * FROM bool_test WHERE active = false")
+            .await?
+            .into_optimized_plan()?;
+        let mv_normal_form = SpjNormalForm::new(&mv_plan)?;
+
+        ctx.sql("CREATE TABLE mv AS SELECT * FROM bool_test WHERE active = false")
+            .await?
+            .collect()
+            .await?;
+
+        let query_plan = ctx
+            .sql("SELECT id, name FROM bool_test WHERE NOT active")
+            .await?
+            .into_optimized_plan()?;
+        let query_normal_form = SpjNormalForm::new(&query_plan)?;
+
+        let table_ref = TableReference::bare("mv");
+        let rewritten = query_normal_form.rewrite_from(
+            &mv_normal_form,
+            table_ref.clone(),
+            provider_as_source(ctx.table_provider(table_ref).await?),
+        )?;
+
+        // Should successfully rewrite
+        assert!(
+            rewritten.is_some(),
+            "Expected MV with 'active = false' to match query with 'NOT active'"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_boolean_true_normalization() -> Result<()> {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let ctx = SessionContext::new();
+
+        ctx.sql(
+            "CREATE TABLE bool_test2 (
+            id INT,
+            enabled BOOLEAN
+        )",
+        )
+        .await?
+        .collect()
+        .await?;
+
+        // Test: MV with "enabled = true" should match query with just "enabled"
+        let mv_plan = ctx
+            .sql("SELECT * FROM bool_test2 WHERE enabled = true")
+            .await?
+            .into_optimized_plan()?;
+        let mv_normal_form = SpjNormalForm::new(&mv_plan)?;
+
+        ctx.sql("CREATE TABLE mv2 AS SELECT * FROM bool_test2 WHERE enabled = true")
+            .await?
+            .collect()
+            .await?;
+
+        let query_plan = ctx
+            .sql("SELECT id FROM bool_test2 WHERE enabled")
+            .await?
+            .into_optimized_plan()?;
+        let query_normal_form = SpjNormalForm::new(&query_plan)?;
+
+        let table_ref = TableReference::bare("mv2");
+        let rewritten = query_normal_form.rewrite_from(
+            &mv_normal_form,
+            table_ref.clone(),
+            provider_as_source(ctx.table_provider(table_ref).await?),
+        )?;
+
+        assert!(
+            rewritten.is_some(),
+            "Expected MV with 'enabled = true' to match query with 'enabled'"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_predicate_getter_and_display() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE t (a INT, b INT, c VARCHAR)")
+            .await?
+            .collect()
+            .await?;
+
+        // Residual: `c LIKE 'foo%'` falls outside eq classes / ranges and
+        // should land in `residuals`. The eq `a = b` populates an
+        // equivalence class, and `a >= 5` narrows its range.
+        let plan = ctx
+            .sql("SELECT a FROM t WHERE a = b AND a >= 5 AND c LIKE 'foo%'")
+            .await?
+            .into_optimized_plan()?;
+        let normal_form = SpjNormalForm::new(&plan)?;
+
+        // Getter returns a reference to the same Predicate that drives
+        // subsumption tests internally; callers can stringify or inspect
+        // it for catalog surfacing / debugging.
+        let rendered = normal_form.predicate().to_string();
+
+        // Display output is AND-joined; check each expected fragment
+        // independently because residuals are hash-set ordered before the
+        // internal sort, so positional matching would be brittle.
+        assert!(
+            rendered.contains("t.a = t.b"),
+            "expected equality from class {{a, b}}, got: {rendered}"
+        );
+        // `a >= 5` should narrow the equivalence class range away from
+        // the default unbounded interval, so Display emits the column +
+        // its non-default interval. Match liberally on `t.a` followed by
+        // a literal `5` so we don't depend on the exact `Interval`
+        // Display formatting.
+        let has_range =
+            rendered.contains("t.a") && rendered.contains("in ") && rendered.contains('5');
+        assert!(
+            has_range,
+            "expected a narrowed range constraint from `a >= 5` to appear, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("t.c LIKE"),
+            "expected LIKE residual, got: {rendered}"
+        );
+        assert!(
+            !rendered.is_empty(),
+            "predicate Display should not be empty when filters exist"
+        );
 
         Ok(())
     }
