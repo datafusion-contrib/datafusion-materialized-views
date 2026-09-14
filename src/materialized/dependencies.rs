@@ -276,7 +276,6 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
     }
 }
 
-#[cfg_attr(doc, aquamarine::aquamarine)]
 /// Returns a logical plan that, when executed, lists expected build targets
 /// for this materialized view, together with the dependencies for each target.
 ///
@@ -304,26 +303,65 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
 /// Assume that both tables are partitioned by `date` only. We desired a materialized view partitioned by `date` and stored at `s3://daily_close/`.
 /// This query gives us the following logical plan:
 ///
-/// ```mermaid
-/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
-/// graph TD
-///     A["Projection: <br>ticker, LAST_VALUE(trades.price) AS close, LAST_VALUE(daily_statistics.settlement_price) AS settlement_price, <mark>trades.date AS date</mark>"]
-///     A --> B["Aggregate: <br>expr=[LAST_VALUE(trades.price), LAST_VALUE(daily_statistics.settlement_price)] <br>groupby=[ticker, <mark>trades.date</mark>]"]
-///     B --> C["Inner Join: <br>trades.ticker = daily_statistics.ticker AND <br>trades.date = daily_statistics.reference_date AND <br><mark>daily_statistics.date BETWEEN trades.date AND trades.date + INTERVAL 2 WEEKS</mark>"]
-///     C --> D["TableScan: trades <br>projection=[ticker, price, <mark>date</mark>]"]
-///     C --> E["TableScan: daily_statistics <br>projection=[ticker, settlement_price, reference_date, <mark>date</mark>]"]
+/// ```text
+///  +--------------------------------------------------------------------+
+///  | Projection:                                                        |
+///  | ticker, LAST_VALUE(trades.price) AS close,                         |
+///  | LAST_VALUE(daily_statistics.settlement_price) AS settlement_price, |
+///  | **trades.date AS date**                                            |
+///  +--------------------------------------------------------------------+
+///                                     |
+///                                     v
+///         +------------------------------------------------------+
+///         | Aggregate:                                           |
+///         | expr=[LAST_VALUE(trades.price),                      |
+///         |       LAST_VALUE(daily_statistics.settlement_price)] |
+///         | groupby=[ticker, **trades.date**]                    |
+///         +------------------------------------------------------+
+///                                     |
+///                                     v
+///           +---------------------------------------------------+
+///           | Inner Join:                                       |
+///           | trades.ticker = daily_statistics.ticker AND       |
+///           | trades.date = daily_statistics.reference_date AND |
+///           | **daily_statistics.date BETWEEN trades.date AND   |
+///           |  trades.date + INTERVAL 2 WEEKS**                 |
+///           +---------------------------------------------------+
+///                                     |
+///               +---------------------+--------------+
+///               v                                    v
+/// +-----------------------------+  +---------------------------------------+
+/// | TableScan: trades           |  | TableScan: daily_statistics           |
+/// | projection=                 |  | projection=[ticker, settlement_price, |
+/// |   [ticker, price, **date**] |  |   reference_date, **date**]           |
+/// +-----------------------------+  +---------------------------------------+
 /// ```
 ///
-/// All partition-column-derived expressions are marked in yellow. We now proceed with **Inexact Projection Pushdown**, and prune all unmarked expressions, resulting in the following plan:
+/// All partition-column-derived expressions are marked with double asterisks (`**`). We now proceed with **Inexact Projection Pushdown**, and prune all unmarked expressions, resulting in the following plan:
 ///
-/// ```mermaid
-/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
-/// graph TD
-///     A["Projection: trades.date AS date"]
-///     A --> B["Projection: trades.date"]
-///     B --> C["Inner Join: <br>daily_statistics.date BETWEEN trades.date AND trades.date + INTERVAL 2 WEEKS"]
-///     C --> D["TableScan: trades (projection=[date])"]
-///     C --> E["TableScan: daily_statistics (projection=[date])"]
+/// ```text
+///            +---------------------------------+
+///            | Projection: trades.date AS date |
+///            +---------------------------------+
+///                             |
+///                             v
+///                +-------------------------+
+///                | Projection: trades.date |
+///                +-------------------------+
+///                             |
+///                             v
+///       +-------------------------------------------+
+///       | Inner Join:                               |
+///       | daily_statistics.date BETWEEN trades.date |
+///       |   AND trades.date + INTERVAL 2 WEEKS      |
+///       +-------------------------------------------+
+///                             |
+///            +----------------+-----------+
+///            v                            v
+/// +---------------------+  +-----------------------------+
+/// | TableScan: trades   |  | TableScan: daily_statistics |
+/// | (projection=[date]) |  | (projection=[date])         |
+/// +---------------------+  +-----------------------------+
 /// ```
 ///
 /// Note that the `Aggregate` node was converted into a projection. This is valid because we do not need to preserve duplicate rows. However, it does imply that
@@ -332,15 +370,38 @@ fn get_table_name(args: &[Expr]) -> Result<&String> {
 /// Now we substitute all scans with equivalent row metadata scans (up to addition or removal of duplicates), and push up the row metadata to the root of the plan,
 /// together with the target path constructed from the (static) partition columns. This gives us the following plan:
 ///
-/// ```mermaid
-/// %%{init: { 'flowchart': { 'wrappingWidth': 1000 }}}%%
-/// graph TD
-///     A["Projection: concat('s3://daily_close/date=', date::string, '/') AS target, __meta"]
-///     A --> B["Projection: __meta, trades.date AS date"]
-///     B --> C["Projection: <br>concat(trades_meta.__meta, daily_statistics_meta.__meta) AS __meta, date"]
-///     C --> D["Inner Join: <br><b>daily_statistics_meta</b>.date BETWEEN <b>trades_meta</b>.date AND <b>trades_meta</b>.date + INTERVAL 2 WEEKS"]
-///     D --> E["TableScan: <b>trades_meta</b> (projection=[__meta, date])"]
-///     D --> F["TableScan: <b>daily_statistics_meta</b> (projection=[__meta, date])"]
+/// ```text
+///  +----------------------------------------------------------------+
+///  | Projection:                                                    |
+///  | concat('s3://daily_close/date=', date::string, '/') AS target, |
+///  | __meta                                                         |
+///  +----------------------------------------------------------------+
+///                                   |
+///                                   v
+///              +-----------------------------------------+
+///              | Projection: __meta, trades.date AS date |
+///              +-----------------------------------------+
+///                                   |
+///                                   v
+///     +----------------------------------------------------------+
+///     | Projection:                                              |
+///     | concat(trades_meta.__meta, daily_statistics_meta.__meta) |
+///     |   AS __meta, date                                        |
+///     +----------------------------------------------------------+
+///                                   |
+///                                   v
+///        +-----------------------------------------------------+
+///        | Inner Join:                                         |
+///        | daily_statistics_meta.date BETWEEN trades_meta.date |
+///        |   AND trades_meta.date + INTERVAL 2 WEEKS           |
+///        +-----------------------------------------------------+
+///                                   |
+///                +------------------+----------------+
+///                v                                   v
+/// +-----------------------------+  +----------------------------------+
+/// | TableScan: trades_meta      |  | TableScan: daily_statistics_meta |
+/// | (projection=[__meta, date]) |  | (projection=[__meta, date])      |
+/// +-----------------------------+  +----------------------------------+
 /// ```
 ///
 /// Here, `__meta` is a column containing a list of structs with the row metadata for each source file. The final query has this struct column
