@@ -37,13 +37,15 @@
 
 use std::sync::Arc;
 
-use datafusion::catalog::CatalogProviderList;
-use datafusion::execution::context::SessionState;
+use datafusion::catalog::{CatalogProviderList, Session};
 use datafusion::execution::TaskContext;
+use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    SendableRecordBatchStream,
 };
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{DataFusionError, Result, TableReference};
 
 use crate::materialized::cast_to_materialized;
@@ -184,13 +186,13 @@ pub enum CandidateMetadata {
 pub struct ReadinessAnnotatedExec {
     inner: Arc<dyn ExecutionPlan>,
     readiness: RewriteReadiness,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ReadinessAnnotatedExec {
     /// Wrap `inner` with the readiness captured atomically at scan time.
     pub fn new(inner: Arc<dyn ExecutionPlan>, readiness: RewriteReadiness) -> Self {
-        let properties = inner.properties().clone();
+        let properties = Arc::clone(inner.properties());
         Self {
             inner,
             readiness,
@@ -225,11 +227,7 @@ impl ExecutionPlan for ReadinessAnnotatedExec {
         "ReadinessAnnotatedExec"
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -237,9 +235,17 @@ impl ExecutionPlan for ReadinessAnnotatedExec {
         vec![&self.inner]
     }
 
-    fn with_new_children(
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Plan(format!(
@@ -253,6 +259,16 @@ impl ExecutionPlan for ReadinessAnnotatedExec {
         )))
     }
 
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -261,11 +277,16 @@ impl ExecutionPlan for ReadinessAnnotatedExec {
         self.inner.execute(partition, context)
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> Result<datafusion_common::Statistics> {
-        self.inner.partition_statistics(partition)
+        input_stats: &[Arc<datafusion_common::Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<datafusion_common::Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 }
 
@@ -275,7 +296,7 @@ impl ExecutionPlan for ReadinessAnnotatedExec {
 /// by the physical-time refresh to prefer atomically-captured readiness
 /// over racy re-sampling.
 pub fn readiness_from_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<RewriteReadiness> {
-    if let Some(annotated) = plan.as_any().downcast_ref::<ReadinessAnnotatedExec>() {
+    if let Some(annotated) = plan.downcast_ref::<ReadinessAnnotatedExec>() {
         return Some(annotated.readiness());
     }
     for child in plan.children() {
@@ -294,13 +315,13 @@ pub fn readiness_from_plan(plan: &Arc<dyn ExecutionPlan>) -> Option<RewriteReadi
 /// optimizers, cost functions, `OneOfExec`, or physical-plan codecs.
 ///
 /// The wrapper is deliberately minimal (it only delegates `properties`,
-/// `execute`, and `partition_statistics`); leaving it in place would
+/// `execute`, and `statistics_from_inputs`); leaving it in place would
 /// silently block optimizer passes such as limit pushdown, projection
 /// pushdown, or `with_preserve_order`, which look at
 /// `ExecutionPlan` trait methods we don't proxy.
 pub fn strip_readiness_annotation(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     plan.transform(&|node: Arc<dyn ExecutionPlan>| {
-        if let Some(annotated) = node.as_any().downcast_ref::<ReadinessAnnotatedExec>() {
+        if let Some(annotated) = node.downcast_ref::<ReadinessAnnotatedExec>() {
             Ok(Transformed::yes(Arc::clone(annotated.inner())))
         } else {
             Ok(Transformed::no(node))
@@ -372,11 +393,12 @@ pub(super) fn drop_not_ready_after_refresh(
 pub(super) async fn refresh_candidate_readiness(
     context: RewriteContext,
     physical_inputs: &[Arc<dyn ExecutionPlan>],
-    session_state: &SessionState,
+    session: &dyn Session,
 ) -> RewriteContext {
-    let catalog_list = session_state.catalog_list();
-    let default_catalog = &session_state.config().options().catalog.default_catalog;
-    let default_schema = &session_state.config().options().catalog.default_schema;
+    let catalog_list = session.catalog_list();
+    let catalog_list = &catalog_list;
+    let default_catalog = &session.config().options().catalog.default_catalog;
+    let default_schema = &session.config().options().catalog.default_schema;
 
     let candidates = context.candidates();
     // Alignment-tolerant zipping: if a caller supplied metadata whose
@@ -521,10 +543,7 @@ mod tests {
 
         let stripped = strip_readiness_annotation(annotated).expect("strip");
         assert!(
-            stripped
-                .as_any()
-                .downcast_ref::<ReadinessAnnotatedExec>()
-                .is_none(),
+            stripped.downcast_ref::<ReadinessAnnotatedExec>().is_none(),
             "top-level wrapper must be gone after strip"
         );
         assert!(Arc::ptr_eq(&stripped, &inner));

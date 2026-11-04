@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{any::Any, borrow::Cow, collections::HashMap, ops::Deref, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, ops::Deref, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use arrow::{array::StringArray, compute::concat_batches, util::pretty};
@@ -33,7 +33,8 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_common::{
-    metadata::ScalarAndMetadata, Constraints, DataFusionError, ParamValues, ScalarValue, Statistics,
+    metadata::ScalarAndMetadata, Constraints, DataFusionError, ParamValues, ScalarValue,
+    Statistics, TableReference,
 };
 use datafusion_expr::{
     col, dml::InsertOp, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, SortExpr,
@@ -47,7 +48,6 @@ use datafusion_materialized_views::materialized::{
     ListingTableLike, Materialized,
 };
 use datafusion_physical_plan::{collect, ExecutionPlan};
-use datafusion_sql::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use itertools::{Either, Itertools};
 use object_store::local::LocalFileSystem;
@@ -69,8 +69,6 @@ struct MaterializedListingOptions {
     file_extension: String,
     format: Arc<dyn FileFormat>,
     table_partition_cols: Vec<String>,
-    collect_stat: bool,
-    target_partitions: usize,
     file_sort_order: Vec<Vec<SortExpr>>,
 }
 
@@ -228,8 +226,6 @@ async fn test_materialized_listing_table_incremental_maintenance() -> Result<()>
                 file_extension: ".parquet".to_string(),
                 format: Arc::<ParquetFormat>::default(),
                 table_partition_cols: vec!["year".into()],
-                collect_stat: false,
-                target_partitions: 1,
                 file_sort_order: vec![vec![SortExpr {
                     expr: col("count"),
                     asc: true,
@@ -349,9 +345,8 @@ impl MaterializedListingTable {
             file_extension: opts.file_extension,
             format: opts.format,
             table_partition_cols,
-            collect_stat: opts.collect_stat,
-            target_partitions: opts.target_partitions,
             file_sort_order: opts.file_sort_order,
+            output_partitioning: None,
         });
 
         let mut listing_table_config = ListingTableConfig::new(config.table_path);
@@ -393,7 +388,7 @@ async fn refresh_materialized_listing_table(
     let table = ctx.table_provider(table_name.clone()).await?;
 
     for target in &targets {
-        refresh_mv_target(ctx, table.as_any().downcast_ref().unwrap(), target).await?;
+        refresh_mv_target(ctx, table.downcast_ref().unwrap(), target).await?;
     }
 
     if ctx
@@ -486,10 +481,6 @@ impl MaterializedListingTable {
 
 #[async_trait::async_trait]
 impl TableProvider for MaterializedListingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -520,7 +511,7 @@ impl TableProvider for MaterializedListingTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {

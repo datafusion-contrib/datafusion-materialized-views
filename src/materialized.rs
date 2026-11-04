@@ -274,23 +274,26 @@ impl TableTypeRegistry {
         &'a self,
         table: &'a dyn TableProvider,
     ) -> Option<&'a dyn ListingTableLike> {
+        let any: &dyn Any = table;
         self.listing_table_accessors
-            .get(&table.as_any().type_id())
-            .and_then(|r| r.value().1(table.as_any()))
+            .get(&any.type_id())
+            .and_then(|r| r.value().1(any))
     }
 
     fn cast_to_materialized<'a>(
         &'a self,
         table: &'a dyn TableProvider,
     ) -> Option<&'a dyn Materialized> {
+        let any: &dyn Any = table;
         self.materialized_accessors
-            .get(&table.as_any().type_id())
-            .and_then(|r| r.value().1(table.as_any()))
+            .get(&any.type_id())
+            .and_then(|r| r.value().1(any))
     }
 
     fn cast_to_decorator<'a>(&'a self, table: &'a dyn TableProvider) -> Option<&'a dyn Decorator> {
+        let any: &dyn Any = table;
         self.decorator_accessors
-            .get(&table.as_any().type_id())
-            .and_then(|r| r.value().1(table.as_any()))
+            .get(&any.type_id())
+            .and_then(|r| r.value().1(any))
     }
 }
