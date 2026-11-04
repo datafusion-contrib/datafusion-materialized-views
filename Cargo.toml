@@ -25,26 +25,26 @@ authors = ["Matthew Cramerus <matt@polygon.io>"]
 license = "Apache-2.0"
 description = "Materialized Views & Query Rewriting in DataFusion"
 keywords = ["arrow", "arrow-rs", "datafusion"]
-rust-version = "1.85.1"
+rust-version = "1.95.0"
 
 [dependencies]
-arrow = "57.1.0"
-arrow-schema = "57.1.0"
+arrow = "60.1.0"
+arrow-schema = "60.1.0"
 async-trait = "0.1.89"
 dashmap = "6"
-datafusion = "52"
-datafusion-common = "52"
-datafusion-expr = "52"
-datafusion-functions = "52"
-datafusion-functions-aggregate = "52"
-datafusion-optimizer = "52"
-datafusion-physical-expr = "52"
-datafusion-physical-plan = "52"
-datafusion-sql = "52"
+datafusion = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-common = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-expr = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-functions = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion-sql = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
 futures = "0.3"
 itertools = "0.14"
 log = "0.4"
-object_store = "0.12.4"
+object_store = "0.14.2"
 ordered-float = "5.0.0"
 
 [dev-dependencies]

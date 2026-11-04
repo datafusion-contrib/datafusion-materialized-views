@@ -85,10 +85,6 @@ struct HivePartitionUdf {
 }
 
 impl ScalarUDFImpl for HivePartitionUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         HIVE_PARTITION_UDF_NAME
     }

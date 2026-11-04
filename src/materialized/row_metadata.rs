@@ -17,9 +17,9 @@
 
 use dashmap::DashMap;
 use datafusion::catalog::TableProvider;
+use datafusion_common::ResolvedTableReference;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{LogicalPlanBuilder, TableScan};
-use datafusion_sql::ResolvedTableReference;
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::{file_metadata::FileMetadata, hive_partition::hive_partition, META_COLUMN};
@@ -174,7 +174,7 @@ impl RowMetadataSource for ObjectStoreRowMetadataSource {
     /// incremental view maintenance.
     fn row_metadata(
         &self,
-        table: datafusion_sql::ResolvedTableReference,
+        table: ResolvedTableReference,
         scan: &datafusion_expr::TableScan,
     ) -> Result<datafusion_expr::LogicalPlanBuilder> {
         use datafusion::{datasource::provider_as_source, prelude::*};
