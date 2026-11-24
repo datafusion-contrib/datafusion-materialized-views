@@ -32,15 +32,15 @@ arrow = "60.1.0"
 arrow-schema = "60.1.0"
 async-trait = "0.1.89"
 dashmap = "6"
-datafusion = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-common = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-expr = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-functions = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-functions-aggregate = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-optimizer = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-physical-expr = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-physical-plan = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
-datafusion-sql = { git = "https://github.com/apache/datafusion.git", branch = "branch-56" }
+datafusion = "56"
+datafusion-common = "56"
+datafusion-expr = "56"
+datafusion-functions = "56"
+datafusion-functions-aggregate = "56"
+datafusion-optimizer = "56"
+datafusion-physical-expr = "56"
+datafusion-physical-plan = "56"
+datafusion-sql = "56"
 futures = "0.3"
 itertools = "0.14"
 log = "0.4"
