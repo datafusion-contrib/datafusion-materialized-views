@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProviderList, TableProvider};
+use datafusion_common::ResolvedTableReference;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_sql::ResolvedTableReference;
 
 /// Retrieves a table from the catalog list given a resolved table reference.
 pub fn get_table(

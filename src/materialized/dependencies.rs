@@ -39,7 +39,7 @@ The transformation is complex, and we give a full walkthrough in the documentati
  */
 
 use datafusion::{
-    catalog::{CatalogProviderList, TableFunctionImpl},
+    catalog::{CatalogProviderList, TableFunctionArgs, TableFunctionImpl},
     config::{CatalogOptions, ConfigOptions},
     datasource::{provider_as_source, TableProvider, ViewTable},
     prelude::{flatten, get_field, make_array},
@@ -48,13 +48,13 @@ use datafusion_common::{
     alias::AliasGenerator,
     internal_err,
     tree_node::{Transformed, TreeNode},
-    DFSchema, DataFusionError, Result, ScalarValue,
+    DFSchema, DataFusionError, Result, ScalarValue, TableReference,
 };
 use datafusion_expr::{
     col, lit, utils::split_conjunction, Expr, LogicalPlan, LogicalPlanBuilder, TableScan,
+    TableScanBuilder,
 };
 use datafusion_functions::string::expr_fn::{concat, concat_ws};
-use datafusion_sql::TableReference;
 use itertools::{Either, Itertools};
 use std::{collections::HashSet, sync::Arc};
 
@@ -119,8 +119,8 @@ impl FileDependenciesUdtf {
 }
 
 impl TableFunctionImpl for FileDependenciesUdtf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let table_name = get_table_name(args)?;
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
+        let table_name = get_table_name(args.exprs())?;
 
         let table_ref = TableReference::from(table_name).resolve(
             &self.config_options.catalog.default_catalog,
@@ -177,13 +177,16 @@ struct StaleFilesUdtf {
 }
 
 impl TableFunctionImpl for StaleFilesUdtf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         use datafusion::prelude::*;
         use datafusion_functions_aggregate::min_max::max;
 
-        let dependencies = provider_as_source(self.mv_dependencies.call(args)?);
+        let dependencies = provider_as_source(
+            self.mv_dependencies
+                .call_with_args(TableFunctionArgs::new(args.exprs(), args.session()))?,
+        );
 
-        let table_name = get_table_name(args)?;
+        let table_name = get_table_name(args.exprs())?;
 
         let table_ref = TableReference::from(table_name).resolve(
             &self.mv_dependencies.config_options.catalog.default_catalog,
@@ -199,68 +202,69 @@ impl TableFunctionImpl for StaleFilesUdtf {
         let url = mv.table_paths()[0].to_string();
         let num_static_partition_cols = mv.static_partition_columns().len();
 
-        let logical_plan =
-            LogicalPlanBuilder::scan_with_filters("dependencies", dependencies, None, vec![])?
-                .aggregate(
-                    vec![col("dependencies.target").alias("expected_target")],
-                    vec![max(col("source_last_modified")).alias("sources_last_modified")],
-                )?
-                .join(
-                    LogicalPlanBuilder::scan_with_filters(
-                        "file_metadata",
-                        provider_as_source(
-                            Arc::clone(&self.file_metadata) as Arc<dyn TableProvider>
+        let logical_plan = LogicalPlanBuilder::table_scan(
+            TableScanBuilder::new("dependencies", dependencies).build()?,
+        )?
+        .aggregate(
+            vec![col("dependencies.target").alias("expected_target")],
+            vec![max(col("source_last_modified")).alias("sources_last_modified")],
+        )?
+        .join(
+            LogicalPlanBuilder::table_scan(
+                TableScanBuilder::new(
+                    "file_metadata",
+                    provider_as_source(Arc::clone(&self.file_metadata) as Arc<dyn TableProvider>),
+                )
+                .with_filters(vec![
+                    col("table_catalog").eq(lit(table_ref.catalog.as_ref())),
+                    col("table_schema").eq(lit(table_ref.schema.as_ref())),
+                    col("table_name").eq(lit(table_ref.table.as_ref())),
+                ])
+                .build()?,
+            )?
+            .aggregate(
+                vec![
+                    // Omit the file name along with any "special" partitions.
+                    // This can include dynamic partition columns as well as some internal
+                    // metadata columns that are not part of the schema
+                    //
+                    // We implement this by only taking the first N columns,
+                    // where N is the number of static partition columns.
+                    array_element(
+                        regexp_match(
+                            col("file_path"),
+                            lit(format!(
+                                "{url}(?:[^/=]+=[^/]+/){{{num_static_partition_cols}}}"
+                            )),
+                            None,
                         ),
-                        None,
-                        vec![
-                            col("table_catalog").eq(lit(table_ref.catalog.as_ref())),
-                            col("table_schema").eq(lit(table_ref.schema.as_ref())),
-                            col("table_name").eq(lit(table_ref.table.as_ref())),
-                        ],
-                    )?
-                    .aggregate(
-                        vec![
-                            // Omit the file name along with any "special" partitions.
-                            // This can include dynamic partition columns as well as some internal
-                            // metadata columns that are not part of the schema
-                            //
-                            // We implement this by only taking the first N columns,
-                            // where N is the number of static partition columns.
-                            array_element(
-                                regexp_match(
-                                    col("file_path"),
-                                    lit(format!(
-                                        "{url}(?:[^/=]+=[^/]+/){{{num_static_partition_cols}}}"
-                                    )),
-                                    None,
-                                ),
-                                lit(1),
-                            )
-                            .alias("existing_target"),
-                        ],
-                        vec![max(col("last_modified")).alias("target_last_modified")],
-                    )?
-                    .project(vec![col("existing_target"), col("target_last_modified")])?
-                    .build()?,
-                    JoinType::Left,
-                    (vec!["expected_target"], vec!["existing_target"]),
-                    None,
-                )?
-                .project(vec![
-                    col("expected_target").alias("target"),
-                    col("target_last_modified"),
-                    col("sources_last_modified"),
-                    nvl(
-                        col("target_last_modified"),
-                        lit(ScalarValue::TimestampNanosecond(
-                            Some(0),
-                            Some(Arc::from("UTC")),
-                        )),
+                        lit(1),
                     )
-                    .lt(col("sources_last_modified"))
-                    .alias("is_stale"),
-                ])?
-                .build()?;
+                    .alias("existing_target"),
+                ],
+                vec![max(col("last_modified")).alias("target_last_modified")],
+            )?
+            .project(vec![col("existing_target"), col("target_last_modified")])?
+            .build()?,
+            JoinType::Left,
+            (vec!["expected_target"], vec!["existing_target"]),
+            None,
+        )?
+        .project(vec![
+            col("expected_target").alias("target"),
+            col("target_last_modified"),
+            col("sources_last_modified"),
+            nvl(
+                col("target_last_modified"),
+                lit(ScalarValue::TimestampNanosecond(
+                    Some(0),
+                    Some(Arc::from("UTC")),
+                )),
+            )
+            .lt(col("sources_last_modified"))
+            .alias("is_stale"),
+        ])?
+        .build()?;
 
         Ok(Arc::new(ViewTable::new(logical_plan, None)))
     }
@@ -703,14 +707,11 @@ fn pushdown_projection_inexact(plan: LogicalPlan, indices: &HashSet<usize>) -> R
                 }));
             }
 
-            TableScan::try_new(
-                scan.table_name,
-                scan.source,
-                Some(new_projection),
-                filters,
-                None,
-            )
-            .map(LogicalPlan::TableScan)
+            TableScanBuilder::new(scan.table_name, scan.source)
+                .with_projection(Some(new_projection))
+                .with_filters(filters)
+                .build()
+                .map(LogicalPlan::TableScan)
         }
         LogicalPlan::EmptyRelation(EmptyRelation {
             produce_one_row,
@@ -1095,6 +1096,8 @@ fn get_source_files_all_partitions(
                             projected_schema: Arc::new(DFSchema::empty()),
                             filters: vec![],
                             fetch: None,
+                            skip: None,
+                            statistics_requests: Default::default(),
                         },
                     )?
                     .build()?;
@@ -1116,7 +1119,7 @@ fn get_source_files_all_partitions(
 
 #[cfg(test)]
 mod test {
-    use std::{any::Any, collections::HashSet, sync::Arc};
+    use std::{collections::HashSet, sync::Arc};
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_schema::{DataType, Field, FieldRef, Fields, SchemaRef};
@@ -1154,10 +1157,6 @@ mod test {
 
     #[async_trait::async_trait]
     impl TableProvider for MockMaterializedView {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             Arc::new(self.query.schema().as_arrow().clone())
         }
@@ -1169,7 +1168,7 @@ mod test {
         async fn scan(
             &self,
             _state: &dyn Session,
-            _projection: Option<&Vec<usize>>,
+            _projection: Option<&[usize]>,
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1210,10 +1209,6 @@ mod test {
 
     #[async_trait::async_trait]
     impl TableProvider for DecoratorTable {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn schema(&self) -> SchemaRef {
             self.inner.schema()
         }
@@ -1225,7 +1220,7 @@ mod test {
         async fn scan(
             &self,
             state: &dyn Session,
-            projection: Option<&Vec<usize>>,
+            projection: Option<&[usize]>,
             filters: &[Expr],
             limit: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1836,12 +1831,12 @@ mod test {
                     FROM t2",
                 projection: &["timestamp", "feed"],
                 expected_plan: vec![
-                    "+--------------+-------------------------------------------------------------------------------------------------------+",
-                    "| plan_type    | plan                                                                                                  |",
-                    "+--------------+-------------------------------------------------------------------------------------------------------+",
-                    "| logical_plan | Projection: to_timestamp_nanos(concat_ws(Utf8(\"-\"), t2.year, t2.month, t2.day)) AS timestamp, t2.feed |",
-                    "|              |   TableScan: t2 projection=[year, month, day, feed]                                                   |",
-                    "+--------------+-------------------------------------------------------------------------------------------------------+",
+                    "+--------------+-----------------------------------------------------------------------------------------------------------+",
+                    "| plan_type    | plan                                                                                                      |",
+                    "+--------------+-----------------------------------------------------------------------------------------------------------+",
+                    "| logical_plan | Projection: to_timestamp_nanos(concat_ws(Utf8View(\"-\"), t2.year, t2.month, t2.day)) AS timestamp, t2.feed |",
+                    "|              |   TableScan: t2 projection=[year, month, day, feed]                                                       |",
+                    "+--------------+-----------------------------------------------------------------------------------------------------------+",
                 ]
                 ,
                 expected_output: vec![
@@ -1942,9 +1937,9 @@ mod test {
                 name: "window & unnest",
                 query_to_analyze: "
                 SELECT
-                    \"__unnest_placeholder(date).year\" AS year,
-                    \"__unnest_placeholder(date).month\" AS month,
-                    \"__unnest_placeholder(date).day\" AS day,
+                    \"date.year\" AS year,
+                    \"date.month\" AS month,
+                    \"date.day\" AS day,
                     arr
                 FROM (
                     SELECT

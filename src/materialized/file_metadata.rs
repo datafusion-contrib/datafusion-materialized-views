@@ -36,15 +36,19 @@ use datafusion::physical_plan::{
 use datafusion::{
     catalog::CatalogProviderList, execution::TaskContext, physical_plan::SendableRecordBatchStream,
 };
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, Operator, TableProviderFilterPushDown, TableType};
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::execution_plan::{
+    apply_expression_roots, Boundedness, ChildrenPropertiesMode, EmissionType,
+    ReplaceChildrenOptions,
+};
 use futures::stream::{self, BoxStream};
 use futures::{future, Future, FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use log::debug;
-use object_store::{ObjectMeta, ObjectStore};
-use std::any::Any;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 
 use crate::materialized::cast_to_listing_table;
@@ -85,10 +89,6 @@ impl FileMetadata {
 
 #[async_trait]
 impl TableProvider for FileMetadata {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.table_schema.clone()
     }
@@ -100,7 +100,7 @@ impl TableProvider for FileMetadata {
     async fn scan(
         &self,
         session_state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -109,14 +109,19 @@ impl TableProvider for FileMetadata {
         let filters = filters
             .iter()
             .map(|expr| {
-                create_physical_expr(expr, &dfschema, session_state.execution_props())
-                    .map_err(|e| e.context("failed to create file metadata physical expr"))
+                create_physical_expr(
+                    expr,
+                    &dfschema,
+                    session_state.execution_props(),
+                    &PhysicalPlanningContext::default(),
+                )
+                .map_err(|e| e.context("failed to create file metadata physical expr"))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let exec = FileMetadataExec::try_new(
             self.table_schema.clone(),
-            projection.cloned(),
+            projection.map(|p| p.to_vec()),
             filters,
             limit,
             self.catalog_list.clone(),
@@ -137,7 +142,7 @@ impl TableProvider for FileMetadata {
 /// An [`ExecutionPlan`] that scans object store metadata.
 pub struct FileMetadataExec {
     table_schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     projection: Option<Vec<usize>>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
     limit: Option<usize>,
@@ -170,7 +175,7 @@ impl FileMetadataExec {
 
         let exec = Self {
             table_schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
             projection,
             filters,
             limit,
@@ -184,15 +189,11 @@ impl FileMetadataExec {
 }
 
 impl ExecutionPlan for FileMetadataExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "FileMetadataExec"
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -200,11 +201,29 @@ impl ExecutionPlan for FileMetadataExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(self.filters.iter(), f)
+    }
+
+    fn replace_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -271,19 +290,19 @@ impl FileMetadataExec {
 
     /// Get the string literal value from an 'equals' BinaryExpr with a column.
     fn get_column_literal(column_idx: usize, filter: &Arc<dyn PhysicalExpr>) -> Option<String> {
-        let binary_expr = filter.as_any().downcast_ref::<BinaryExpr>()?;
+        let binary_expr = filter.downcast_ref::<BinaryExpr>()?;
 
         if !matches!(binary_expr.op(), Operator::Eq) {
             return None;
         }
 
         let (column, literal) =
-            if let Some(left_column) = binary_expr.left().as_any().downcast_ref::<Column>() {
-                let right_literal = binary_expr.right().as_any().downcast_ref::<Literal>()?;
+            if let Some(left_column) = binary_expr.left().downcast_ref::<Column>() {
+                let right_literal = binary_expr.right().downcast_ref::<Literal>()?;
                 (left_column, right_literal)
             } else {
-                let right_column = binary_expr.right().as_any().downcast_ref::<Column>()?;
-                let left_literal = binary_expr.left().as_any().downcast_ref::<Literal>()?;
+                let right_column = binary_expr.right().downcast_ref::<Column>()?;
+                let left_literal = binary_expr.left().downcast_ref::<Literal>()?;
                 (right_column, left_literal)
             };
 

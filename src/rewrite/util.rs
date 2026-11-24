@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProviderList, TableProvider};
 use datafusion_common::DataFusionError;
-use datafusion_sql::ResolvedTableReference;
+use datafusion_common::ResolvedTableReference;
 
 /// List every table in the catalog list.
 /// Always returns a fully qualified table reference.
